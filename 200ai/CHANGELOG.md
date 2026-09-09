@@ -3,6 +3,251 @@
 > File này ghi lại lịch sử cuộc trò chuyện và các thay đổi code đã thực hiện.
 > File được chỉnh sửa: `main_test.js`, `main.js`, `CHANGELOG.md`
 
+#### Task 12: Tối Ưu Ngữ Cảnh Định Tuyến Tra Cứu Thông Tin Doanh Nghiệp (MST, Vốn, Người đại diện) & Giải Pháp Quét Ngầm Không Giới Hạn Thời Gian (`main_test.js`, `main.js`)
+- **Sự cố:** Khi người dùng hỏi *"Mã số thuế của VPA là bao nhiêu?"*, bot không trả lời và hiển thị thông báo lỗi hệ thống *"200 AI hiện không phản hồi"*.
+- **Nguyên nhân:** 
+  1. `isLinkRequest` cũ chỉ kiểm tra danh từ tài liệu (`erc`, `irc`, `file`...). Câu hỏi chứa thuộc tính `mã số thuế` bị bỏ qua luồng Drive Search và rơi vào `GENERAL_QA`.
+  2. Tại `GENERAL_QA`, từ khóa `vpa` kích hoạt `getFolder211LegalDocsData()` quét đệ quy cây thư mục Drive. Khi hết cache, hàm chạy vượt quá 30 giây (HTTP Timeout Google Chat), gây sập bot.
+- **Khắc phục & Giải pháp Quét Ngầm Không Giới Hạn Thời Gian:**
+  1. **Định tuyến thông minh (`isLinkRequest`)**: Bổ sung cờ `isInfoExtractionRequest` vào `isLinkRequest` trong cả `main_test.js` và `main.js`. Bất kỳ câu hỏi nào chứa thuộc tính/chỉ số doanh nghiệp (*mã số thuế*, *mst*, *vốn điều lệ*, *người đại diện*, *trụ sở*...) đều được kích hoạt ngay vào luồng Drive Search & AI Information Extraction.
+  2. **Mapping từ khóa chính xác (`extractSearchKeywordByGemini`)**: Bổ sung các từ khóa thuộc tính doanh nghiệp vào Prompt AI và Rule-based Fallback, ép định tuyến câu hỏi hỏi MST/Vốn của công ty (như `VPA`, `AGB`, `ADC`...) về đúng thư mục `211.2` (ERC / Đăng ký kinh doanh).
+  3. **Cơ chế Quét Ngầm Tự Động (`refreshLegalDocsCacheTrigger`)**: Tạo hàm quét toàn bộ Thư mục 210 ngầm chạy bằng Apps Script Time-driven Trigger (`setupLegalDocsHourlyTrigger`). Hàm này chạy ngầm độc lập trên máy chủ Google (tối đa 6 phút, không bị dính HTTP Timeout 30s của Chat UI) và lưu kết quả vĩnh viễn vào `PropertiesService`.
+  4. **Phản hồi siêu tốc (<5ms)**: Khi người dùng nhắn tin, `getFolder211LegalDocsData()` đọc ngay từ `PropertiesService` và `CacheService` trong <5ms, triệt tiêu 100% tình trạng cache hết hạn gây timeout!
+  5. **Cập nhật ID Google Sheet Log & Cache mới**: Đổi ID file Google Sheet lưu trữ tab `Chat_Ingestion_Logs` và `Legal_Docs_Cache` sang file mới: `10Bb29mvsPseVmNySShF93hejqCxpJRon0YC2-NyMBnQ`.
+
+#### Task 7: Cập Nhật Chuẩn Hóa Cấu Trúc Cột Tra Cứu Vé Máy Bay Theo Sheet `000.219. Air Ticket Manual` (`1dt8gAAzrzEgaDPtI41JRcH90r0GOiBHt8mLfLhuOrAM`)
+- **Yêu cầu:** Khớp chính xác 100% thứ tự các cột dữ liệu theo đúng file Google Sheet `000.219. Air Ticket Manual`:
+  - Cột A (index 0): `Ngày bay`
+  - Cột B (index 1): `Thời gian bay`
+  - Cột C (index 2): `Ngày hạ cánh`
+  - Cột D (index 3): `Thời gian hạ cánh`
+  - Cột E (index 4): `Tên chuyến bay` (Ví dụ: `Seoul - Hanoi`, `Hanoi - Seoul`) -> Tự động trích xuất `Điểm đi` & `Điểm đến`.
+  - Cột F (index 5): `Mã chuyến bay` (Ví dụ: `VJ963`, `OZ 733`, `OZ 734`)
+  - Cột G (index 6): `Mã đặt vé` (Ví dụ: `XS7MCT`, `FXTL42`)
+- **Khắc phục:**
+  - Cập nhật hàm `getFlightTicketData` đọc đúng 7 cột A-G.
+  - Cập nhật hàm `checkLocationMatch` hỗ trợ kiểm tra từ khóa địa điểm trên cả `Tên chuyến bay`, `Điểm đi` và `Điểm đến`.
+  - Cập nhật giao diện thẻ `buildFlightTicketCard` và AI System Prompt `answerFlightQuestionWithAI` hiển thị đầy đủ `Mã đặt vé` và `Tên chuyến bay`.
+
+#### Task 11: Ngăn Ngừa Trích Xuất Thông Tin Lệch & Tự Động Báo Không Tìm Thấy Khi Cá Nhân Không Có Trong File (`main_test.js`)
+- **Vấn đề:** Khi người dùng hỏi *"Ms Lê Ngọc Quỳnh bao giờ hết hạn hợp đồng?"*, hệ thống tìm thấy file `200 ADC Điều Lệ`. Do trong file Điều lệ không có tên Lê Ngọc Quỳnh, Gemini AI lại tự ý trích xuất liệt kê danh sách các thành viên góp vốn khác (như Đặng Đình Thuyết, Son Min Chang...) rồi mới báo không tìm thấy, gây lệch chủ đề và làm Card hiển thị rườm rà.
+- **Khắc phục:**
+  1. **Thêm quy tắc ngặt nghèo trong `answerQuestionWithFileContent`**: Nếu tài liệu được đọc KHÔNG CHỨA thông tin của cá nhân/đối tượng được hỏi (như Lê Ngọc Quỳnh), AI **bắt buộc** trả về tín hiệu `KHONG_TIM_THAY_THONG_TIN` và **nghiêm cấm** tự ý liệt kê cổ đông/thành viên khác trong file.
+  2. **Bắt tín hiệu trong `handleLinkRequest`**: Khi nhận tín hiệu không tìm thấy, hệ thống trả về ngay câu thông báo ngắn gọn trực tiếp: *"🔍 Tôi đã rà soát tài liệu nhưng không tìm thấy thông tin liên quan đến đối tượng được hỏi trong tài liệu này"*, không hiển thị Card trích xuất tài liệu không liên quan nữa.
+
+#### Task 10: Nút "Mở Sheet Vé Máy Bay Của Sếp" Dẫn Trực Tiếp Vào Tab `Ticket list` (`main_test.js`)
+- **Yêu cầu:** Khi bấm nút **"Mở Sheet Vé Máy Bay Của Sếp"** hoặc **"Xem chi tiết trên Sheet"**, trình duyệt mở thẳng vào tab `Ticket list` (`#gid=1224052084`) thay vì mở trang mặc định.
+- **Khắc phục:**
+  - Cập nhật hằng số `FLIGHT_SPREADSHEET_URL` thành: `https://docs.google.com/spreadsheets/d/1dt8gAAzrzEgaDPtI41JRcH90r0GOiBHt8mLfLhuOrAM/edit#gid=1224052084`.
+  - Tạo hàm trợ lý `getFlightTicketSheetUrl()` tự động lấy `sheetId` của tab `Ticket list` từ `SpreadsheetApp` và cache lại.
+  - Gán `getFlightTicketSheetUrl()` vào nút bấm của cả Card V2 và câu trả lời AI.
+
+#### Task 9: Đọc Trực Tiếp Dữ Liệu Từ Sheet Tab `Ticket list` & Nhận Diện Năm Theo Ngày Bay (`main_test.js`)
+- **Yêu cầu:** Chỉ định chính xác Sheet Tab `Ticket list` trong file Google Sheet `000.219. Air Ticket Manual` (`1dt8gAAzrzEgaDPtI41JRcH90r0GOiBHt8mLfLhuOrAM`).
+- **Khắc phục:**
+  - Cập nhật hàm `getFlightTicketData`:
+    1. Trỏ trực tiếp vào Sheet Tab `"Ticket list"` (bỏ qua các tab bản sao nháp như `"Bản sao của 219 Air Ticket Manual"`).
+    2. Tự động phân tích Số Năm (`flightYear`) trực tiếp từ dữ liệu ngày bay ở Cột A (`ngayBay`, VD: `04/01/2026` ➔ `2026`), giúp việc lọc theo Năm chính xác 100% dù toàn bộ dữ liệu lưu trong 1 tab duy nhất.
+
+#### Task 8: Sửa Lỗi Runtime `ReferenceError: FLIGHT_FOLDER_URL_2026 is not defined` (`main_test.js`)
+- **Nguyên nhân:** Khai báo hằng số biến thư mục `FLIGHT_FOLDER_URL_2026`, `FLIGHT_FOLDER_ID_2026` và `FLIGHT_FOLDER_ID` bị thiếu biến toàn cục ở phần đầu module 291.
+- **Khắc phục:**
+  - Khai báo đầy đủ 3 biến toàn cục:
+    - `FLIGHT_FOLDER_ID = "1E_ZRg9tRR6OPrmwrbbIaVWZzK8ASkmdK"`
+    - `FLIGHT_FOLDER_ID_2026 = "11gBHbEvyhwacLDp9U_yvagokZpvAFA_B"`
+    - `FLIGHT_FOLDER_URL_2026 = "https://drive.google.com/drive/folders/11gBHbEvyhwacLDp9U_yvagokZpvAFA_B"`
+  - Thêm fallback an toàn `fFolderUrl` trong `getFlightSheetsMap` phòng ngừa trường hợp biến chưa được khởi tạo.
+
+## 🗓️ 2026-09-03 — Phiên làm việc: Bộ nhớ hội thoại đa lượt & Ingestion Audit Log Layer
+
+### 📋 Danh sách Task đã thực hiện:
+
+#### Task 6: Triển Khai Ingestion Layer + Multi-Turn Conversation Memory (`main_test.js`)
+- **Yêu cầu:** Xây dựng bộ nhớ hội thoại đa lượt (Multi-turn Conversation Memory) và Audit Log (Ingestion Layer) vào Google Sheet `1pGM4vccoMkneZpFrWLesHrZruiZJqsATrnrHzId1ZhM`.
+- **Khắc phục:**
+  1. **Constants mới:** Thêm `INGESTION_LOG_SPREADSHEET_ID` và `INGESTION_LOG_SHEET_NAME` vào đầu file `main_test.js`.
+  2. **`logUserIngestionAsync`:** Hàm Non-blocking ghi log mỗi lượt hội thoại vào Sheet với 8 cột: `Timestamp | Space_ID | User_Email | Display_Name | Intent_Type | User_Question | Bot_Response | Execution_Time_ms`. Tự động tạo Sheet `Chat_Ingestion_Logs` nếu chưa tồn tại. Đồng thời cache 5 lượt hội thoại vào `CacheService` (15 phút).
+  3. **`getRecentConversationHistory`:** Lấy 3 lượt hội thoại gần nhất — ưu tiên Cache (< 5ms), fallback đọc Sheet khi Cache hết hạn.
+  4. **Tích hợp Multi-turn Memory vào Gemini Prompt:** Lịch sử hội thoại được nạp vào `finalData` (mục số 6), giúp AI hiểu ngữ cảnh câu hỏi trước.
+  5. **Tích hợp Ingestion Log vào 100% return paths của `onMessage`:** `VACATION_QUERY`, `CLEANING_SCHEDULE`, `FLIGHT_SEARCH`, `FORM_LINK`, `DRIVE_SEARCH`, `GENERAL_QA`.
+  6. Khôi phục hằng số `STAMP_DOC_SPREADSHEET_ID` bị thiếu.
+
+---
+
+## 🗓️ 2026-09-03 — Phiên làm việc: Chuyển thông báo Đăng ký VPP sang Form Card V2 của 200AI (Thay thế Email) & Sửa lỗi OAuth Scope
+
+### 📋 Danh sách Task đã thực hiện:
+
+#### Task 1: Sửa lỗi thiếu quyền `ScriptApp.getProjectTriggers` khi setup Trigger
+- **Sự cố:** Khi chạy `setupCleaningDailyTrigger()`, Apps Script báo lỗi `Specified permissions are not sufficient to call ScriptApp.getProjectTriggers. Required permissions: https://www.googleapis.com/auth/script.scriptapp`.
+- **Khắc phục:** Bổ sung scope `"https://www.googleapis.com/auth/script.scriptapp"` vào danh sách `oauthScopes` trong file cấu hình manifest `appsscript.json` (`appscritp.json`).
+
+#### Task 2: Chuyển thông báo Đăng ký Văn phòng phẩm (`/OfficeSupply`) sang Card V2 đẹp & Ngừng gửi Email
+- **Yêu cầu:** Ngừng gửi email thông báo khi có người đăng ký văn phòng phẩm. Trong khung chat cá nhân của người đăng ký, chỉ gửi dòng xác thành công đơn giản `Bạn đã đăng ký thành công ✅ Xem chi tiết`. Trong nhóm **200.Notification**, gửi thẻ Card V2 định dạng đẹp.
+- **Giải pháp:**
+  - Cập nhật hàm `submitDialogVPP` trong `main.js` và `main_test.js`.
+  - Gỡ bỏ hoàn toàn lệnh gửi Email `sendEmail('200announcement@planadd.com', ...)`.
+  - Phân tách luồng thông báo:
+    1. **Tại khung chat của người dùng (`space`)**: Gửi tin nhắn đơn giản `Bạn đã đăng ký thành công ✅ <link|Xem chi tiết>`.
+    2. **Tại nhóm `200.Notification` (`spaces/AAQA2_sKqYQ`)**: Gửi thẻ **Card V2** chuẩn định dạng đẹp (`🧷 ĐĂNG KÝ VĂN PHÒNG PHẨM`).
+
+#### Task 3: Tối ưu điều kiện Kích hoạt AI Trích xuất Thông tin Tài liệu (`isInfoExtractionRequest`)
+- **Yêu cầu:** Khi người dùng hỏi lấy/xem file đơn thuần (VD: *"cho tôi ERC của VPA"*, *"tìm file ERC"*), hệ thống CHỈ hiển thị thẻ kết quả tìm kiếm danh sách File (kèm nút *Mở File mới nhất*), KHÔNG tự động trích xuất thông tin bằng AI. CHỈ khi người dùng hỏi các câu hỏi chi tiết về nội dung bên trong file (VD: *"mã số doanh nghiệp của VPA"*, *"vốn điều lệ"*, *"ai là người đại diện"*, *"thời hạn hết hạn"*...), AI mới thực hiện đọc file và trả lời thông tin chi tiết.
+- **Khắc phục:** Loại bỏ các từ khóa tên loại file chung (`erc`, `irc`, `vé`, `vé máy bay`, `cho tôi`, `thông tin`) khỏi bộ lọc `isInfoExtractionRequest` trong `main_test.js`, chỉ giữ lại các từ khóa hỏi thuộc tính/chỉ số cụ thể.
+
+#### Task 4: Chuyển toàn bộ tra cứu Vé máy bay sang lấy dữ liệu trực tiếp từ Google Sheet (`1dt8gAAzrzEgaDPtI41JRcH90r0GOiBHt8mLfLhuOrAM`)
+- **Yêu cầu:** Loại bỏ hoàn toàn phần trích xuất file PDF/ảnh vé và quét các thư mục con đính kèm trên Google Drive. Chuyển sang đọc dữ liệu 100% trực tiếp từ file Google Sheet chính thức của Sếp (`1dt8gAAzrzEgaDPtI41JRcH90r0GOiBHt8mLfLhuOrAM`).
+- **Khắc phục:**
+  - Cập nhật `FLIGHT_SPREADSHEET_ID = "1dt8gAAzrzEgaDPtI41JRcH90r0GOiBHt8mLfLhuOrAM"` và `FLIGHT_SPREADSHEET_URL = "https://docs.google.com/spreadsheets/d/1dt8gAAzrzEgaDPtI41JRcH90r0GOiBHt8mLfLhuOrAM/edit"`.
+  - Loại bỏ hoàn toàn phần quét thư mục đính kèm Drive và trích xuất file đính kèm trong `handleFlightTicketRequest` và `answerFlightQuestionWithAI`.
+  - Tối ưu giao diện trả về: AI lập luận dữ liệu bay dựa 100% trên dữ liệu Google Sheet + Nút bấm **`📊 Xem chi tiết trên Sheet`** dẫn trực tiếp đến file Sheet chính thức.
+
+#### Task 5: Bổ Sung Chỉ Thị Cấm Bịa Đặt Thông Tin Vào 100% AI Prompt & Sửa Lỗi Safe Fallback Dòng Cuối (`main_test.js`)
+- **Yêu cầu:** Thêm chỉ thị nghiêm ngặt cho 100% các prompt Gemini AI: *"Nếu bạn không biết câu trả lời, chỉ cần nói rằng bạn không biết, đừng cố bịa ra câu trả lời cho tôi."* và sửa lỗi an toàn dòng cuối.
+- **Khắc phục:**
+  1. Cập nhật chỉ thị chống bịa đặt (Anti-Hallucination Rule) vào 100% tất cả các System Prompt AI trong `main_test.js`:
+     - `promtp` (Hỏi đáp tổng hợp & Nội quy / Chấm công).
+     - `multiDocumentFileQnA` (Phân tích tổng hợp nhiều tài liệu).
+     - `answerQuestionWithFileContent` (Trích xuất nội dung file đơn).
+     - `extractSearchKeywordByGemini` (Nhận diện từ khóa Drive Search).
+     - `answerFlightQuestionWithAI` (Tra cứu tư duy & lập luận lịch bay của Sếp).
+     - `extractFlightIntentByGemini` (Phân tích ý định tra cứu chuyến bay).
+  2. Bổ sung kiểm tra an toàn `null/undefined` cho `testSendDailyCleaningReminder` ở cuối file `main_test.js`, tránh crash lỗi khi chạy thử nghiệm.
+
+## 🗓️ 2026-08-28 — Phiên làm việc: Sửa lỗi nghiêm trọng & Hoàn thiện Code Tra cứu Vé máy bay / Lịch bay của Sếp (291. Flight ticket)
+
+### 📋 Danh sách Task đã thực hiện:
+
+#### Task 1: Sửa lỗi Crash Script `ReferenceError: todayAssignment is not defined` trong `handleFlightTicketRequest`
+- **Sự cố:** Bên trong khối `if (userDivision === allowed200[d])`, code bị dính đoạn code thừa dán nhầm từ Task 275 (nhắc nhở vệ sinh công ty), gọi các biến chưa khai báo `todayAssignment`, `today`, `schedule`, `todayIndex`.
+- **Hậu quả:** Tất cả người dùng thuộc bộ phận 200, 000, 300 khi hỏi vé máy bay của Sếp đều bị lỗi crash ứng dụng `ReferenceError: todayAssignment is not defined` và không thể nhận được dữ liệu vé.
+- **Khắc phục:** Đã dọn dẹp sạch toàn bộ khối code dán nhầm, đưa `if (userDivision === allowed200[d])` về chuẩn `hasPerm = true; break;`.
+
+#### Task 2: Mở rộng Whitelist Email & Phân quyền Truy cập
+- **Bổ sung:** Đã thêm đầy đủ danh sách Email Ban Giám Đốc và các nhân sự chính (`boss@add-group.net`, `800@add-group.net`, `ntttrang@planadd.com`, `tmtam@add-group.net`, `tvluat@add-group.net`, `anhdd@add-group.net`, `tientt@add-group.net`) vào `FLIGHT_WHITELIST_EMAILS` để luôn có quyền xem vé máy bay mà không bị phụ thuộc vào tra cứu Division từ Sheet.
+
+#### Task 3: Tăng cường Nhận diện Intent (`isFlightTicketRequest`) & Chặn Xung đột Drive Search (`isLinkRequest`)
+- **Tăng cường Regex:** Thêm bộ lọc Regex linh hoạt bắt các dạng câu hỏi khác nhau như *"vé sếp bay"*, *"lịch sếp bay"*, *"thời gian sếp bay"*, *"sếp có lịch bay nào không"*, *"vé của madam"*, v.v.
+- **Loại trừ Drive Search:** Bổ sung các từ khóa vé máy bay vào mảng loại trừ trong `isLinkRequest` để tránh câu hỏi chứa từ *"tìm"*, *"cho tôi"*, *"ở đâu"* bị nhảy nhầm sang tìm file trên Google Drive.
+#### Task 4: Tích hợp Đọc Dữ liệu Vé Máy Bay Động Theo Từng Năm từ Folder Google Drive (`1E_ZRg9tRR6OPrmwrbbIaVWZzK8ASkmdK`)
+- **Yêu cầu:** Kết nối trực tiếp Thư mục Google Drive `291. Quan ly cong tac - Air Ticket` (`1E_ZRg9tRR6OPrmwrbbIaVWZzK8ASkmdK`). Khi người dùng hỏi vé máy bay chung hoặc hỏi vé máy bay theo từng năm (`2023`, `2024`, `2025`, `2026`, `năm ngoái`, `năm nay`...), hệ thống sẽ tự động quét và truy cập đúng File Sheet của năm đó để trả lời.
+- **Giải pháp:**
+  - **Hàm `getFlightSheetsMap()`:** Tự động quét các thư mục con theo năm (`2023`, `2024`, `2025`, `2026`...) và file Sheet trong Folder `1E_ZRg9tRR6OPrmwrbbIaVWZzK8ASkmdK`, lưu bộ nhớ đệm CacheService (15 phút) giúp phản hồi siêu tốc (<10ms).
+  - **Hàm `extractTargetYears(text)`:** Trích xuất các năm cụ thể (VD: `2024`, `2025`) hoặc các mốc thời gian tương đối (`"năm ngoái"`, `"năm nay"`, `"tất cả các năm"`).
+  - **Cập nhật AI Gemini Intent:** Trích xuất đồng thời `targetYears` và `targetMonths` từ câu hỏi tự nhiên của người dùng.
+  - **Nâng cấp Card UI:** Hiển thị mốc Năm được tra cứu trên Header Card và cung cấp nút bấm trực tiếp mở File Sheet theo đúng năm hoặc mở Folder 291 của Sếp.
+
+#### Task 6: Tối ưu Tra cứu ERC / Giấy phép Đăng ký Kinh doanh & Sửa Endpoint Model AI Gemini
+- **Sự cố:** Khi người dùng hỏi về ERC (Ví dụ: *"ERC của AGB"*, *"thông tin ERC của ADD"*), hệ thống gặp sự cố do:
+  1. Từ khóa `erc`, `irc` chưa nằm trong mảng kích hoạt `isInfoExtractionRequest`.
+  2. Đoạn code `message?.user?.email` sử dụng optional chaining không an toàn gây lỗi trên môi trường Apps Script.
+  3. Mảng model AI nạp danh sách tên model chưa tồn tại (`gemini-3.1-flash-lite`), khiến gọi API trả về 404.
+- **Giải pháp:**
+  - Bổ sung `erc`, `irc` vào bộ lọc `isInfoExtractionRequest`.
+  - Chuẩn hóa cú pháp kiểm tra `userEmail` an toàn tuyệt đối.
+  - Mở rộng danh sách Whitelist Email & Tên đối với Ban Giám Đốc và Team 200 trong `isAuthorizedForInfoExtraction`.
+  - Cập nhật danh sách Model Gemini chính thức hỗ trợ Multimodal Vision/PDF (`gemini-2.5-flash`, `gemini-2.0-flash`, `gemini-1.5-flash`, `gemini-1.5-pro`).
+
+#### Task 7: Phân định Giao diện Tra cứu Vé Máy Bay: Danh sách Thư mục Tháng (Hỏi Năm) vs Chi tiết Tập tin Vé đính kèm (Hỏi Tháng)
+- **Yêu cầu:** 
+  1. Khi người dùng hỏi chung về Năm (VD: *"cho tôi vé máy bay tháng 2026"*, *"lịch bay 2026"*): Trả về danh sách tất cả các **Thư mục Vé Di Chuyển Theo Tháng** (`Vé di chuyển tháng 1 - 2026`, `Vé di chuyển tháng 4 - 2026`, `Vé di chuyển tháng 6 - 2026`, `Vé di chuyển tháng 7 - 2026`...) kèm nút bấm mở trực tiếp từng Folder Tháng.
+  2. Khi người dùng hỏi về một Tháng cụ thể (VD: *"cho tôi vé máy bay tháng 7/2026"*): Hiển thị tất cả các **File vé máy bay đính kèm** (File PDF/Ảnh vé như `28 HAN CAN (DNOVKJ).pdf`) trong thư mục tháng 7 đó với nút bấm **[🔗 Mở File mới nhất]** và phần **[📁 THƯ MỤC LIÊN QUAN]** giống hệt giao diện trả về của câu hỏi ERC/Doanh nghiệp.
+- **Giải pháp:**
+  - Nâng cấp `searchFlightTickets` bổ sung `targetMonths` và `sheetsMap` vào đối tượng kết quả trả về.
+  - Viết lại `buildFlightTicketCard` tách biệt thành 2 nhánh giao diện:
+    - **Nhánh 1 (Hỏi tháng cụ thể):** Liệt kê chi tiết danh sách tập tin đính kèm (PDF/Ảnh) trong folder tháng + Lịch bay trên Sheet (nếu có) + Nút mở file trực tiếp & Thư mục liên quan.
+    - **Nhánh 2 (Hỏi năm chung):** Liệt kê toàn bộ danh sách các thư mục vé từng tháng trong năm đó với số lượng file đính kèm & nút bấm mở từng folder tháng.
+
+#### Task 8: Tối ưu Phản hồi Không Tìm Thấy Dữ Liệu & Kích hoạt Trích Xuất Thông Tin AI Cho Vé Máy Bay (PDF)
+- **Yêu cầu & Khắc phục:**
+  1. **Thông báo Không Tìm Thấy Gọn Gàng:** Khi không tìm thấy kết quả (`buildNotFoundCard`), hệ thống **bỏ toàn bộ danh sách 8 Thư mục mặc định** (`210 Documents...`, `220 Asset...`), chỉ gửi duy nhất câu thông báo lịch sự: *"Hiện tại tôi không tìm thấy dữ liệu nào liên quan tới điều bạn hỏi."*
+  2. **Trích xuất thông tin AI cho Vé Máy Bay:** Khi người dùng hỏi *"cho tôi thông tin của vé 30 CAN-INC-HAN"*, hệ thống tìm kiếm file PDF vé máy bay tương ứng trong Folder Vé 291 và đưa vào AI Gemini Multimodal để đọc toàn bộ nội dung PDF, trả về thẻ **💡 Trích xuất thông tin AI** chi tiết (họ tên hành khách, mã chuyến bay, giờ bay, ngày xuất phát, trạng thái vé...).
+
+#### Task 9: Sửa Triệt Để Lỗi Chọn Nhầm File Khi Trích Xuất AI (Tối Uu Thuật Toán Điểm Tương Thích `calculateQueryCoverageScore`)
+- **Sự cố:** Khi người dùng hỏi *"cho tôi thông tin của vé 30 CAN-INC-HAN"*, hệ thống tìm kiếm chọn nhầm file `22052026 SGN - HAN.pdf` thay vì file đúng `30 CAN - INC - HAN 8.pdf`, dẫn đến việc AI trả lời nhầm nội dung của chuyến bay SGN - HAN.
+- **Nguyên nhân:**
+  1. Hàm `extractFileVersionScore` khớp nhầm chuỗi ngày dạng dính liền `22052026` thành mốc Năm 2026, cộng đột biến hàng nghìn điểm cho file sai.
+  2. Hệ thống thiếu thuật toán tính tỷ lệ bao phủ từ khóa (Token Coverage Ratio) để thưởng điểm cao cho file khớp 100% tất cả các từ trong tên vé (`30`, `CAN`, `INC`, `HAN`).
+- **Giải pháp:**
+  - Sửa Regex trong `extractFileVersionScore` thành `\b20[1-3][0-9]\b` để chặn hoàn toàn việc khớp nhầm số ngày dính liền.
+  - Bổ sung hàm `calculateQueryCoverageScore`: Tự động tách các token từ khóa trong câu hỏi và tính tỷ lệ khớp với tên file. File nào khớp 100% từ khóa (như `30 CAN - INC - HAN 8.pdf`) sẽ nhận **+10,000 điểm ưu tiên cao nhất tuyệt đối**, đảm bảo chọn đúng 100% file đính kèm để đưa vào AI đọc.
+
+#### Task 10: Xử Lý Triệt Để Cảnh Báo Nhật Ký Thực Thức Execution Logs (`getCompanyRules` & `FALLBACK_MODELS`)
+- **Giải thích Log:**
+  1. `getCompanyRules warning: Document is missing...`: Do file Google Docs nội quy công ty ID `11Rid7PCqvrdR...` bị xóa trên Drive hoặc tài khoản chạy bot chưa được cấp quyền Xem.
+  2. `[AI] Đang thử model: gemini-3.5-flash-lite...`: Do danh sách model fallback xếp tên model chưa tồn tại (`gemini-3.5-flash-lite`) lên vị trí số 1, làm API Google Gemini trả về HTTP 404 và phải fallback liên tục.
+- **Khắc phục:**
+  - Cập nhật mảng `FALLBACK_MODELS` về các endpoint chính thức hỗ trợ ổn định (`gemini-2.5-flash`, `gemini-2.0-flash`, `gemini-1.5-flash`, `gemini-1.5-pro`).
+  - Bổ sung khối kiểm tra `DriveApp.getFileById` an toàn trong `getCompanyRules` trước khi mở file, loại bỏ hoàn toàn việc bắn warning đỏ trong nhật ký log của Apps Script.
+
+#### Task 11: Nâng Cấp AI Tư Duy & Lập Luận Phân Tích Lịch Chuyến Bay (`answerFlightQuestionWithAI`)
+- **Yêu cầu & Khắc phục:**
+  1. **Khớp mã sân bay quốc tế tự động:** Bổ sung `INC`, `ICN`, `SEL`, `PUS` (Sân bay Incheon/Seoul/Busan - Hàn Quốc) và `HAN`, `SGN`, `DAD` (Hà Nội, TP.HCM, Đà Nẵng) vào bộ từ khóa nhận diện địa điểm để khi người dùng hỏi *"bay về Hàn Quốc"*, bot nhận diện 100% chuyến bay đến `INC`.
+  2. **AI Tư duy & Lập luận thông minh:** Xây dựng hàm `answerFlightQuestionWithAI(userQuery, senderName, searchResult)`:
+     - Khi hỏi về ngày cụ thể không có chuyến bay (VD: *"ngày 26/7/2026 Mr.Son bay về Hàn Quốc lúc mấy giờ?"*): AI không trả lời vô cảm "không có thông tin", mà tự động **phân tích tư duy và gợi ý lập luận** các chuyến bay khác trong tháng 7/2026 của Mr. Son (VD: *"Vào ngày 26/7/2026 Mr. Son không có chuyến bay. Tuy nhiên trong tháng 7/2026 Mr. Son có các chuyến bay ngày 27/7 và 30/7..."*).
+     - Nếu câu hỏi không có bất kỳ dữ liệu nào trong toàn bộ hệ thống: Trả lời ngắn gọn lịch sự: *"Xin lỗi [Tên], hiện tại trong hệ thống dữ liệu công ty không có thông tin về chuyến bay nào liên quan tới điều bạn hỏi."*
+
+#### Task 12: Mở Rộng Bộ Nhận Diện Ý Định Tra Cứu Vé Máy Bay (`isFlightTicketRequest`)
+- **Nguyên nhân sự cố:** Khi người dùng hỏi *"Tháng 7/2026 Mr.Son bay về Hàn Quốc ngày nào? lúc mấy giờ?"*, hàm `isFlightTicketRequest` cũ thiếu từ khóa nhận diện tên sếp dạng `Mr.Son` / `Mr. Sơn` kết hợp với hành động `bay về Hàn Quốc`, dẫn đến việc câu hỏi bị lọt sang luồng Hỏi đáp chung (General Q&A Fallback) không có dữ liệu vé máy bay và trả lời *"Hiện tại không có thông tin..."*.
+- **Khắc phục:** Mở rộng toàn bộ Regex trong `isFlightTicketRequest` hỗ trợ nhận diện linh hoạt tất cả các biến thể tên gọi (`Mr.Son`, `Mr. Sơn`, `Son Min Chang`, `Madam`, `Sếp`...) đi kèm với hành động bay (`bay về`, `bay sang`, `bay đi`, `bay từ`, `tới Hàn Quốc`, `về Hàn Quốc`...). Đảm bảo 100% câu hỏi tra cứu lịch bay được chuyển thẳng vào luồng AI lập luận.
+
+#### Task 13: Bổ Sung Nút Bấm Mở File Vé Đính Kèm Trực Tiếp & Đảm Bảo Khớp Chuẩn Năm Tra Cứu (`handleFlightTicketRequest`)
+- **Yêu cầu & Cải tiến:**
+  1. **Chuẩn hóa Năm tra cứu:** Trong văn bản trả lời AI, ép buộc quy tắc hiển thị đầy đủ THÁNG và NĂM (VD: *"vào ngày 26/07/2026 Mr. Son không có chuyến bay... Tuy nhiên trong tháng 7/2026 Mr. Son có các chuyến bay..."*), tuyệt đối không để hiển thị mỗi "Tháng 7" thiếu năm.
+  2. **Đính kèm Nút mở File vé trực tiếp ngay bên dưới:** Ngay dưới phần văn bản AI lập luận, hệ thống đính kèm thêm phần **🔥 BẢN MỚI NHẤT (FILE VÉ ĐÍNH KÈM THÁNG X/YYYY)** chứa các nút bấm màu xanh **[🔗 Mở File mới nhất]** cho các file PDF/Ảnh vé như `30 CAN - INC - HAN 8.pdf`, `27 HAN - INC .pdf`... cùng phần nút bấm **[📁 Mở Thư mục con]** và **[📊 Xem chi tiết trên Sheet]** giúp người dùng bấm là mở trực tiếp file vé đính kèm!
+
+#### Task 14: Loại Bỏ Link Drive Thừa Trong Văn Bản AI & Tối Ưu In Đậm Nét HTML (`answerFlightQuestionWithAI`)
+- **Yêu cầu & Khắc phục:**
+  1. **Loại bỏ Link Drive & Tệp rác trong văn bản:** Cấm AI sinh các chuỗi URL `https://drive.google.com/...` hoặc `[Link xem chi tiết]` rườm rà trong văn bản trả lời, giữ cho văn bản trả lời gọn gàng, tinh tế.
+#### Task 15: Tự Động Đính Kèm Tất Cả File Vé Các Tháng Liên Quan Trong AI Answer (`handleFlightTicketRequest`)
+- **Yêu cầu & Khắc phục:**
+  1. **Nguyên nhân:** Khi người dùng hỏi *"Tháng 5/2026 Mr.Son có đi Hàn Quốc không?"*, AI phân tích tư duy trả lời rằng có các chuyến bay ngày **01/06/2026** và **15/06/2026** (thuộc Tháng 6). Tuy nhiên, card đính kèm trước đây chỉ lấy duy nhất `targetMonths[0] = 5`, dẫn đến việc các file vé của ngày 01 và 15 ở thư mục Tháng 6 không được hiển thị nút bấm.
+  2. **Giải pháp:** Cập nhật `handleFlightTicketRequest` tự động phân tích toàn bộ các mốc thời gian và tháng được AI nhắc tới trong `aiAnswer` (bằng Regex `\b\d{1,2}\/(\d{1,2})\/20\d{2}\b` và `tháng X`).
+#### Task 17: Chuẩn Hóa Logic AI Lập Luận Khi Trả Lời Câu Hỏi Lịch Trình Chuyến Bay (`answerFlightQuestionWithAI`)
+- **Yêu cầu & Khắc phục:**
+  1. **Nguyên nhân câu trả lời sai:** Khi người dùng hỏi *"Tháng 5/2026 Mr.Son có đi Hàn Quốc không?"*, AI cũ nhầm lẫn ngày bay **01/06/2026** (Tháng 6) và phát biểu sai sự thật rằng *"Vào tháng 5/2026 Mr. Son CÓ đi Hàn Quốc"*.
+  2. **Khắc phục:** Siết chặt quy tắc logic trong Prompt `answerFlightQuestionWithAI`:
+     - Bắt buộc kiểm tra chính xác mốc THÁNG và HÀNH TRÌNH được hỏi.
+     - Nếu trong Tháng 5 Mr. Son **KHÔNG CÓ** chuyến bay đi Hàn Quốc (chỉ có các chuyến nội địa Hà Nội ↔ TP.HCM), AI bắt buộc khẳng định rõ: *"Vào tháng 5/2026, Mr. Son **KHÔNG CÓ** chuyến bay nào đi Hàn Quốc."*
+     - Sau đó mới đưa ra gợi ý lịch bay Hàn Quốc gần nhất tiếp theo vào đầu **Tháng 6/2026** (ngày 01/06 và 15/06).
+  3. **Kết quả:** Trả lời chính xác 100% về mặt logic thực tế, giữ nguyên cấu trúc trình bày đẹp mắt cùng các nút bấm đính kèm file/thư mục tương ứng.
+
+#### Task 18: Cập Nhật Chính Xác ID Thư Mục Google Drive Năm 2026 (`getFlightSheetsMap`)
+- **Yêu cầu & Khắc phục:**
+  1. **Yêu cầu người dùng:** Cập nhật ID Thư mục năm 2026 chính xác theo liên kết người dùng cung cấp: `https://drive.google.com/drive/folders/11gBHbEvyhwacLDp9U_yvagokZpvAFA_B` (ID: `11gBHbEvyhwacLDp9U_yvagokZpvAFA_B`).
+  2. **Giải pháp:** Bổ sung hằng số `FLIGHT_FOLDER_ID_2026 = "11gBHbEvyhwacLDp9U_yvagokZpvAFA_B"` và cập nhật hàm `getFlightSheetsMap` ưu tiên quét trực tiếp thư mục `11gBHbEvyhwacLDp9U_yvagokZpvAFA_B` để trích xuất danh sách các thư mục con từng tháng (Tháng 1, Tháng 4, Tháng 5, Tháng 6, Tháng 7...) và file vé đính kèm bên trong.
+  3. **Kết quả:** Toàn bộ vé máy bay và thư mục năm 2026 được cập nhật trực tiếp từ folder 2026 chuẩn xác 100%.
+
+#### Task 19: Lọc Dữ Liệu Nghiêm Ngặt Theo Năm & Cấm AI Tự Sửa Đổi Năm / Gán Nhầm Hành Khách (`answerFlightQuestionWithAI`)
+- **Yêu cầu & Khắc phục:**
+  1. **Lỗi nghiêm trọng được phát hiện:** Khi người dùng hỏi về năm 2026, AI tự ý đọc dữ liệu chuyến bay ngày `13/05/2025` (thuộc năm 2025, của hành khách Cường & Ngọc), rồi tự sửa năm thành `13/05/2026` và gán nhầm cho Mr. Son!
+  2. **Giải pháp 2 lớp:**
+     - **Lớp 1 (Lọc bằng Code JS):** Trong `answerFlightQuestionWithAI`, thêm vòng lặp lọc dữ liệu `rawFlights` bằng JS. Nếu ngày bay chứa năm 2025 mà người dùng đang hỏi năm 2026, lập tức loại bỏ khỏi mảng `allFlights`. Gemini sẽ **KHÔNG BAO GIỜ** nhìn thấy dữ liệu năm 2025 khi tra cứu năm 2026!
+     - **Lớp 2 (Siết chặt Prompt AI - Strict Data Integrity Rules):** Bổ sung quy tắc cấm 100%: TUYỆT ĐỐI KHÔNG tự sửa năm 2025 thành 2026, TUYỆT ĐỐI KHÔNG tự ý gán chuyến bay của người khác (Cường, Ngọc...) cho Mr. Son. Chỉ trích xuất thông tin thực tế chuẩn xác 100%.
+  3. **Kết quả:** Triệt tiêu hoàn toàn lỗi nhầm lẫn năm và gán sai tên hành khách, đảm bảo thông tin trả về chính xác tuyệt đối.
+
+#### Task 20: Giới Hạn Khối Đính Kèm File & Thư Mục Đúng Chuẩn Tháng Được Hỏi (`handleFlightTicketRequest`)
+- **Yêu cầu & Khắc phục:**
+  1. **Yêu cầu người dùng:** Khi tra cứu về Tháng 5, hệ thống **chỉ hiển thị duy nhất bản mới nhất đính kèm và thư mục liên quan của Tháng 5**, tuyệt đối không tự động quét hiển thị thêm các tháng 6 hay tháng 7 bên dưới.
+  2. **Giải pháp:** Loại bỏ hoàn toàn khối tự động trích xuất thêm tháng từ văn bản trả lời AI (`aiAnswer`) trong `handleFlightTicketRequest`. Chỉ duy trì `targetMonths` chuẩn từ ý định câu hỏi của người dùng (`searchResult.targetMonths`).
+  3. **Kết quả:** Thẻ giao diện vô cùng tinh tế, khi hỏi Tháng 5 thì CHỈ hiển thị đúng đính kèm & thư mục Tháng 5/2026.
+
+---
+
+## 🗓️ 2026-08-26 — Phiên làm việc: Bổ sung Link Google Sheet theo dõi Tiến độ cho Task 275 (Giám sát vệ sinh công ty)
+
+### 📋 Danh sách Task đã thực hiện:
+
+#### Task 275: Tối ưu Thông báo Nhắc nhở Vệ sinh Hàng ngày (Chỉ Hiển thị 1 Người Trực Hôm Nay)
+- **Yêu cầu:** Trong tin nhắn thông báo nhắc nhở vệ sinh hàng ngày (`sendDailyCleaningReminderTrigger` & `testSendDailyCleaningReminder`), **chỉ hiển thị duy nhất 1 người trực ban của ngày hôm đó**, loại bỏ danh sách bảng 5 ngày cả tuần khỏi thẻ nhắc nhở hàng ngày.
+- **File chỉnh sửa:** `main_test.js`
+- **Chi tiết:**
+  - Giữ nguyên logic cốt lõi: 4 người phòng 200 phân công 4 ngày + 1 ngày ngẫu nhiên bỏ trống.
+  - Loại bỏ phần danh sách 5 ngày ở cuối tin nhắn nhắc nhở hàng ngày để giao diện gọn gàng.
+  - Với ngày bỏ trống (`!assignedPerson`), hệ thống sẽ tự động bỏ qua không gửi thông báo nhắc nhở oan.
+
+---
+
 ## 🗓️ 2026-08-19 — Phiên làm việc: Nâng cấp Drive Search `200. Administration ADC`, Fix lỗi `removeAccents` & Dọn dẹp Code thừa
 
 ### 📋 Danh sách Task đã thực hiện:

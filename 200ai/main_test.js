@@ -5,9 +5,10 @@ const SHEET_NAME = 'Data';
 const DOC_DELIVERY_SPREADSHEET_ID = '16OvxNx6hzoaXR9CiKS0d7XuUgNOXrSX5z6mpAcwfHwI';
 const DOC_DELIVERY_SHEET_NAME = '2026';
 
-const STAMP_DOC_SPREADSHEET_ID = '1jmiNyx69vxJE4xhJV8t5y2L5jrLwVZhZ2TswDSQX6Wg';
+const INGESTION_LOG_SPREADSHEET_ID = '10Bb29mvsPseVmNySShF93hejqCxpJRon0YC2-NyMBnQ';
+const INGESTION_LOG_SHEET_NAME = 'Chat_Ingestion_Logs';
 
-// var sheet = SpreadsheetApp.openById(SPREADSHEET_ID).getSheetByName(SHEET_NAME);
+const STAMP_DOC_SPREADSHEET_ID = '1jmiNyx69vxJE4xhJV8t5y2L5jrLwVZhZ2TswDSQX6Wg';
 
 const BUILD_ID = 'otregister-debug-2026-04-20-01';
 
@@ -60,7 +61,181 @@ function getIncomingMessageText(event) {
   return '';
 }
 
+// ============================================================================
+// 🧠 INGESTION LAYER & MULTI-TURN CONVERSATION MEMORY (Audit Log & Memory)
+// Google Sheet ID: 1pGM4vccoMkneZpFrWLesHrZruiZJqsATrnrHzId1ZhM
+// ============================================================================
+
+/**
+ * Ghi log lưu vết câu hỏi và câu trả lời vào Google Sheet Ingestion Layer.
+ * Chạy bất đồng bộ an toàn (Non-blocking): Lỗi ghi log không bao giờ làm ngắt phản hồi cho User.
+ */
+function logUserIngestionAsync(event, intentType, questionText, responseText, executionTimeMs) {
+  try {
+    var spaceId = event?.space?.name || "DM";
+    var userEmail = event?.user?.email || "N/A";
+    var displayName = event?.user?.displayName || "N/A";
+    var nowStr = Utilities.formatDate(new Date(), "Asia/Ho_Chi_Minh", "dd/MM/yyyy HH:mm:ss");
+
+    var qClean = (questionText || "").trim();
+    var rClean = "";
+    if (typeof responseText === "string") {
+      rClean = responseText.trim();
+    } else if (responseText && responseText.text) {
+      rClean = responseText.text.trim();
+    } else if (responseText && responseText.cardsV2) {
+      // Trích xuất text thực từ các widgets trong Card V2 thay vì log "[Card V2 Response]"
+      try {
+        var textParts = [];
+        var cards = responseText.cardsV2;
+        for (var ci = 0; ci < cards.length; ci++) {
+          var card = cards[ci].card;
+          if (!card) continue;
+          // Thêm tiêu đề header
+          if (card.header && card.header.title) textParts.push("[" + card.header.title + "]");
+          var sections = card.sections || [];
+          for (var si = 0; si < sections.length; si++) {
+            var widgets = sections[si].widgets || [];
+            for (var wi = 0; wi < widgets.length; wi++) {
+              var w = widgets[wi];
+              if (w.textParagraph && w.textParagraph.text) {
+                // Bỏ thẻ HTML để lấy text thuần
+                var plain = w.textParagraph.text.replace(/<[^>]+>/g, "").trim();
+                if (plain) textParts.push(plain);
+              }
+              if (w.buttonList && w.buttonList.buttons) {
+                for (var bi = 0; bi < w.buttonList.buttons.length; bi++) {
+                  if (w.buttonList.buttons[bi].text) {
+                    textParts.push("[Nút: " + w.buttonList.buttons[bi].text + "]");
+                  }
+                }
+              }
+            }
+          }
+        }
+        rClean = textParts.join(" | ");
+        if (!rClean) rClean = "[Card V2 Response]";
+      } catch (eParse) {
+        rClean = "[Card V2 Response]";
+      }
+    } else {
+      rClean = JSON.stringify(responseText) || "";
+    }
+    if (rClean.length > 2000) rClean = rClean.substring(0, 2000) + "... [Truncated]";
+
+    // Cache lại lượt chat mới nhất vào CacheService (cho Multi-turn Memory)
+    var cacheKey = "CHAT_MEM_" + removeAccents(spaceId + "_" + userEmail).replace(/[^a-z0-9]/g, "_");
+    try {
+      var cachedMemory = CacheService.getScriptCache().get(cacheKey);
+      var memList = cachedMemory ? JSON.parse(cachedMemory) : [];
+      memList.push({ time: nowStr, user: qClean, bot: rClean.substring(0, 300) });
+      if (memList.length > 5) memList = memList.slice(-5); // Giữ 5 lượt gần nhất
+      CacheService.getScriptCache().put(cacheKey, JSON.stringify(memList), 900); // Cache 15 phút
+    } catch (eMem) { }
+
+    // Ghi vào Google Sheet Ingestion Layer
+    var ss = SpreadsheetApp.openById(INGESTION_LOG_SPREADSHEET_ID);
+    var sheet = ss.getSheetByName(INGESTION_LOG_SHEET_NAME);
+    if (!sheet) {
+      sheet = ss.insertSheet(INGESTION_LOG_SHEET_NAME);
+      sheet.appendRow([
+        "Timestamp",
+        "Space_ID",
+        "User_Email",
+        "Display_Name",
+        "Intent_Type",
+        "User_Question",
+        "Bot_Response",
+        "Execution_Time_ms"
+      ]);
+      sheet.getRange("1:1").setFontWeight("bold").setBackground("#e8f0fe");
+    }
+
+    sheet.appendRow([
+      nowStr,
+      spaceId,
+      userEmail,
+      displayName,
+      intentType || "GENERAL_QA",
+      qClean,
+      rClean,
+      executionTimeMs || 0
+    ]);
+  } catch (e) {
+    Logger.log("logUserIngestionAsync error: " + e.message);
+  }
+}
+
+/**
+ * Lấy lịch sử hội thoại gần đây (Multi-turn Conversation Memory) từ CacheService / Google Sheet
+ * Trả về chuỗi định dạng đưa vào Gemini System Prompt.
+ */
+function getRecentConversationHistory(spaceId, userEmail, limitTurns) {
+  limitTurns = limitTurns || 3;
+  if (!spaceId && !userEmail) return "";
+
+  var spaceKey = spaceId || "DM";
+  var emailKey = userEmail || "N/A";
+  var cacheKey = "CHAT_MEM_" + removeAccents(spaceKey + "_" + emailKey).replace(/[^a-z0-9]/g, "_");
+
+  // 1. Lấy từ CacheService (Tốc độ < 5ms)
+  try {
+    var cachedMemory = CacheService.getScriptCache().get(cacheKey);
+    if (cachedMemory) {
+      var memList = JSON.parse(cachedMemory);
+      if (memList && memList.length > 0) {
+        var recent = memList.slice(-limitTurns);
+        return recent.map(function (m) {
+          return "• Người dùng: \"" + m.user + "\"\n  ➔ Bot trả lời: \"" + m.bot + "\"";
+        }).join("\n");
+      }
+    }
+  } catch (eCache) { }
+
+  // 2. Nếu Cache hết hạn, đọc 30 dòng gần nhất từ Google Sheet Ingestion Layer
+  try {
+    var ss = SpreadsheetApp.openById(INGESTION_LOG_SPREADSHEET_ID);
+    var sheet = ss.getSheetByName(INGESTION_LOG_SHEET_NAME);
+    if (!sheet) return "";
+
+    var lastRow = sheet.getLastRow();
+    if (lastRow <= 1) return "";
+
+    var startRow = Math.max(2, lastRow - 30);
+    var numRows = lastRow - startRow + 1;
+    var data = sheet.getRange(startRow, 1, numRows, 7).getDisplayValues();
+
+    var history = [];
+    var targetUser = (userEmail || "").toLowerCase().trim();
+
+    for (var r = data.length - 1; r >= 0; r--) {
+      var rowSpace = String(data[r][1] || "").trim();
+      var rowEmail = String(data[r][2] || "").toLowerCase().trim();
+      var rowQ = String(data[r][5] || "").trim();
+      var rowR = String(data[r][6] || "").trim();
+
+      if ((targetUser && rowEmail === targetUser) || (spaceId && rowSpace === spaceId)) {
+        if (rowQ) {
+          history.unshift({ user: rowQ, bot: rowR.substring(0, 300) });
+          if (history.length >= limitTurns) break;
+        }
+      }
+    }
+
+    if (history.length > 0) {
+      return history.map(function (h) {
+        return "• Người dùng: \"" + h.user + "\"\n  ➔ Bot trả lời: \"" + h.bot + "\"";
+      }).join("\n");
+    }
+  } catch (eSheet) {
+    Logger.log("getRecentConversationHistory error: " + eSheet.message);
+  }
+
+  return "";
+}
+
 function onMessage(event) {
+  const startTime = new Date().getTime();
   try {
     const userEmail = event.user?.email || "";
     const BOSS_EMAILS = ["boss@add-group.net", "800@add-group.net", "ntttrang@planadd.com", "tmtam@add-group.net", "tvluat@add-group.net"];
@@ -93,6 +268,7 @@ Tôi có thể hỗ trợ bạn với các chức năng sau:
   • Tra cứu nội quy, quy định nhân sự của công ty
   • Xem dữ liệu chấm công tháng gần nhất (muộn, quên, tổng công...)
   • Tra cứu điểm Penalty & Bonus cá nhân
+  • Tra cứu lịch bay & vé máy bay của Sếp (291)
   • Tìm link form mẫu tài liệu của ADD Group
 
 ⚙️ *Lệnh nhanh* (gõ chính xác để mở form)
@@ -104,6 +280,7 @@ Tôi có thể hỗ trợ bạn với các chức năng sau:
 
 💡 *Ví dụ câu hỏi:*
   _"Tháng này tôi đi muộn mấy lần?"_
+  _"Tháng này Sếp có lịch bay nào về Việt Nam không?"_
   _"Điểm Bonus của tôi hiện tại là bao nhiêu?"_
   _"Đơn xin nghỉ phép ở đâu?"_
 
@@ -328,25 +505,45 @@ Bạn cần tôi hỗ trợ gì hôm nay? 🙋`;
     }
 
     // 🌴 Kiểm tra ý định hỏi số ngày phép còn lại (bao gồm cả gõ nhầm "phéo")
-    var isVacationQuery = /(?:ngày\s*phép|ngày\s*phéo|phép\s*năm|phép\s*còn|còn\s*phép|số\s*phép|phép\s*lại|nghỉ\s*phép|phép|phéo|vacation|leave)/i.test(lowerCleaned) && !/(?:đơn|mẫu|thủ\s*tục|hướng\s*dẫn|cách|ở\s*đâu).*(?:xin|đăng\s*ký).*(?:phép|phéo)/i.test(lowerCleaned);
+    // Bỏ qua nếu đây là câu hỏi về quy định / thử việc / chính sách chung (để AI trả lời theo Nội quy)
+    var isPolicyOrRuleQuery = /(?:thử\s*việc|quy\s*định|điều\s*lệ|nội\s*quy|chính\s*sách|thế\s*nào|như\s*thế\s*nào|có\s*được.*không|có.*không)/i.test(lowerCleaned);
+    var isVacationQuery = !isPolicyOrRuleQuery && /(?:ngày\s*phép|ngày\s*phéo|phép\s*năm|phép\s*còn|còn\s*phép|số\s*phép|phép\s*lại|nghỉ\s*phép|vacation|leave)/i.test(lowerCleaned) && !/(?:đơn|mẫu|thủ\s*tục|hướng\s*dẫn|cách|ở\s*đâu).*(?:xin|đăng\s*ký).*(?:phép|phéo)/i.test(lowerCleaned);
     if (isVacationQuery) {
-      return handleVacationQuery(cleanedMessage, displayName, userEmail);
+      var vacResult = handleVacationQuery(cleanedMessage, displayName, userEmail);
+      logUserIngestionAsync(event, "VACATION_QUERY", message, vacResult, new Date().getTime() - startTime);
+      return vacResult;
     }
 
     // 🧹 Kiểm tra ý định hỏi Lịch trực vệ sinh công ty (Phòng 200 - Task 275)
     var isCleaningQuery = /(?:vệ\s*sinh|lịch\s*vệ\s*sinh|trực\s*vệ\s*sinh|ai\s*vệ\s*sinh|ai\s*trực|dọn\s*dẹp|sạch\s*sẽ|clean|office\s*clean)/i.test(lowerCleaned);
     if (isCleaningQuery) {
-      return handleCleaningScheduleQuery(displayName);
+      var cleanResult = handleCleaningScheduleQuery(displayName);
+      logUserIngestionAsync(event, "CLEANING_SCHEDULE", message, cleanResult, new Date().getTime() - startTime);
+      return cleanResult;
     }
 
     // ✈️ Kiểm tra ý định hỏi Vé máy bay / Lịch bay / Ngày bay từ Google Sheet (291. Flight ticket)
     if (isFlightTicketRequest(cleanedMessage)) {
-      return handleFlightTicketRequest(cleanedMessage, displayName, userEmail);
+      var flightResult = handleFlightTicketRequest(cleanedMessage, displayName, userEmail);
+      logUserIngestionAsync(event, "FLIGHT_SEARCH", message, flightResult, new Date().getTime() - startTime);
+      return flightResult;
+    }
+
+    // 📋 Kiểm tra ý định hỏi Form / Link mẫu chung (CHƯƠNG 3 – nội quy công ty)
+    // Ưu tiên trả link trực tiếp, KHÔNG đẩy vào Drive Search
+    if (isFormLinkRequest(cleanedMessage)) {
+      var formResult = handleFormLinkRequest(cleanedMessage, displayName);
+      if (formResult) {
+        logUserIngestionAsync(event, "FORM_LINK", message, formResult, new Date().getTime() - startTime);
+        return formResult;
+      }
     }
 
     // 🌟 Kiểm tra ý định tìm kiếm tài liệu / file / folder / điều lệ / sổ đỏ trong Google Drive
     if (isLinkRequest(cleanedMessage)) {
-      return handleLinkRequest(cleanedMessage, displayName, event);
+      var linkResult = handleLinkRequest(cleanedMessage, displayName, event);
+      logUserIngestionAsync(event, "DRIVE_SEARCH", message, linkResult, new Date().getTime() - startTime);
+      return linkResult;
     }
 
     if (isPenaltyBonus) {
@@ -1386,13 +1583,13 @@ Bạn cần tôi hỗ trợ gì hôm nay? 🙋`;
 
     // === TỐI ƯU HÓA NGUỒN DỮ LIỆU ĐỂ AI THÔNG MINH & TRẢ LỜI ĐÚNG TRỌNG TÂM ===
     // 1. Quy định công ty (Nội quy, Điều 2 Xử phạt đi muộn, Link Form Mẫu) LUÔN NẠP (0ms)
-    var companyRules = getCompanyRules();
+    var companyRules = companyRule();
 
-    // 2. Chỉ nạp dữ liệu chấm công khi người dùng THỰC SỰ HỎI VỀ CHẤM CÔNG (muộn, trễ, quên, checkin, checkout, tổng công...)
-    var isAttendance = /muộn|trễ|quên|về sớm|chấm công|checkin|checkout|check in|giờ vào|giờ ra/.test(lowerRes);
+    // 2. Chỉ nạp dữ liệu chấm công khi người dùng THỰC SỰ HỎI VỀ CHẤM CÔNG (muộn, trễ, quên, về sớm, công, ngày công, tổng công, checkin, checkout...)
+    var isAttendance = /muộn|trễ|quên|về sớm|chấm công|checkin|checkout|check in|giờ vào|giờ ra|công|ngày công|tổng công|số công|đi làm/.test(lowerRes);
 
-    // 3. Chỉ nạp dữ liệu Penalty & Bonus khi hỏi về tim, bom, điểm đánh giá
-    var isPenalty = /penalty|bonus|phạt|thưởng|tim|bom|❤️|💣|điểm|đánh giá/.test(lowerRes);
+    // 3. Chỉ nạp dữ liệu Penalty & Bonus khi hỏi về tim, bom, điểm đánh giá, penalty, bonus
+    var isPenalty = /penalty|bonus|phạt|thưởng|tim|bom|❤️|💣|điểm|đánh giá|điểm phạt|điểm thưởng|số penalty/.test(lowerRes);
 
     // 4. Chỉ nạp dữ liệu Văn Bản Pháp Lý Thư mục 210 (Documents Management: 211→219) khi hỏi về pháp lý / 211 / văn bản / hợp đồng / điều lệ / ERC / IRC
     var isLegalDoc = /pháp lý|phap ly|211|văn bản|van ban|tài liệu|tai lieu|hợp đồng|hop dong|giấy phép|giay phep|điều lệ|dieu le|erc|irc|đăng ký|giấy chứng nhận|chứng nhận|nhãn hiệu|đấu thầu|bổ nhiệm|sổ đỏ|bất động sản|quyết định|hồ sơ|passport|visa|work permit|công văn|biên bản|bàn giao|năng lực|adc|add|agb|asg|tym|vpa|worksmate/i.test(lowerRes);
@@ -1408,11 +1605,14 @@ Bạn cần tôi hỗ trợ gì hôm nay? 🙋`;
     var currentAskingNickName = askingUserDetail ? askingUserDetail.nickName : "";
     var currentAskingFullName = askingUserDetail ? askingUserDetail.fullName : (event.user?.displayName || 'Anh/Chị');
 
+    var conversationHistory = getRecentConversationHistory(event.space?.name, event.user?.email, 3);
+
     var finalData = '------------------- 1.Quy Định Công Ty (Nội quy, Công thức phạt đi muộn Điều 2, Tất cả Link Form Mẫu) -------------------\n' + companyRules;
     if (staffMappingTable) finalData += '\n' + staffMappingTable;
     if (bodyData) finalData += '\n----------------------- 3.Dữ liệu chấm công --------------\n' + bodyData;
     if (penaltyData) finalData += '\n---------------------- 4.Dữ Liệu Hệ Thống Đánh Giá (Penalty & Bonus) ---------------------\n' + penaltyData;
     if (legalDocData) finalData += '\n---------------------- 5.Dữ Liệu Văn Bản Thư Mục 210 (Documents Management: 211 Company Legal, 212 Reporting, 213 Passport/Visa, 214→219) ---------------------\n' + legalDocData;
+    if (conversationHistory) finalData += '\n---------------------- 6.Lịch Sử Hội Thoại Gần Đây (Multi-turn Memory) ---------------------\n' + conversationHistory;
 
     var promtp1 = "THÔNG TIN NGƯỜI ĐANG ĐẶT CÂU HỎI (ĐỐI TƯỢNG 'TÔI'):\n" +
       "- Họ và tên người dùng: " + currentAskingFullName + "\n" +
@@ -1436,8 +1636,8 @@ Bạn cần tôi hỗ trợ gì hôm nay? 🙋`;
       "- NẾU CÂU HỎI BẰNG TIẾNG ANH ➔ TRẢ LỜI BẰNG TIẾNG ANH.\n\n" +
       "Đây là dữ liệu từ các nguồn của công ty:\n" + finalData + "\n\nVà đây là câu hỏi của anh/chị " + currentAskingFullName + ": " + JSON.stringify(response) + "\n. Nhiệm vụ của bạn là đánh giá câu hỏi sau đó chọn đúng nguồn dữ liệu sau đó trả lại câu trả lời ĐÚNG TRỌNG TÂM, NGẮN GỌN VÀ DÙNG ĐÚNG NGÔN NGỮ CỦA CÂU HỎI. YÊU CẦU QUAN TRỌNG VỀ ĐỊNH DẠNG: BẮT BUỘC dùng định dạng in đậm Markdown **nội dung** cho tất cả các thông tin quan trọng trong câu trả lời. QUY TẮC TRẢ LỜI:\n" +
       "- Nếu hỏi bằng Tiếng Hàn (한국어): Dịch toàn bộ thông tin phản hồi sang Tiếng Hàn lịch sự (존댓말), bao gồm lời chào, nội dung giải đáp và câu chúc.\n" +
-      "- Nếu hỏi về văn bản pháp lý, hồ sơ công ty, hợp đồng, điều lệ hoặc tài liệu thuộc Thư mục 211 (ADC, ADD, AGB, ASG, TYM VINA, VPA, Worksmate...): BẮT BUỘC liệt kê danh sách tài liệu tìm thấy, tóm tắt nội dung chính và đính kèm Link xem dạng '<link|Tên tài liệu>'.\n" +
-      "- Nếu hỏi về mẫu đơn, biên bản: Trả lời ngay câu chào + link mẫu đơn '<link|Tên mẫu đơn>'. CẤM IN DÒNG THÔNG BÁO CHẤM CÔNG CẬP NHẬT!\n" +
+      "- Nếu hỏi về văn bản pháp lý, hồ sơ công ty, hợp đồng, điều lệ hoặc tài liệu thuộc Thư mục 211 (ADC, ADD, AGB, ASG, TYM VINA, VPA, Worksmate...): BẮT BUỘC liệt kê danh sách tài liệu tìm thấy, tóm tắt nội dung chính và đính kèm URL đầy đủ dạng '• **Tên tài liệu** — URL_đầy_đủ'. TUYỆT ĐỐI KHÔNG dùng cú pháp '<link|...>' vì Google Chat không hỗ trợ!\n" +
+      "- Nếu hỏi về mẫu đơn, biên bản: Trả lời ngay câu chào + URL đầy đủ dạng '• **Tên mẫu đơn** — URL_đầy_đủ'. Google Chat sẽ tự bấm được link. CẤM IN DÒNG THÔNG BÁO CHẤM CÔNG CẬP NHẬT! TUYỆT ĐỐI KHÔNG dùng cú pháp '<link|...>'!\n" +
       "- Khi hỏi 'hướng dẫn đăng ký tăng ca/OT' hoặc 'đăng ký OT': CHỈ TRẢ LỜI 1 DÒNG hướng dẫn dùng lệnh '• */OTRegistration* — Đăng ký làm thêm giờ'. TUYỆT ĐỐI KHÔNG IN LINK FORM HOẶC SHEET, KHÔNG IN LẠI WELCOME MESSAGE VÀ CẤM IN DÒNG THÔNG BÁO CHẤM CÔNG!\n" +
       "- Khi hỏi 'hướng dẫn đặt văn phòng phẩm' hoặc 'đăng ký văn phòng phẩm': CHỈ TRẢ LỜI 1 DÒNG hướng dẫn dùng lệnh '• */OfficeSupply* — Đặt văn phòng phẩm'. TUYỆT ĐỐI KHÔNG IN LINK FORM HOẶC SHEET, KHÔNG IN LẠI WELCOME MESSAGE VÀ CẤM IN DÒNG THÔNG BÁO CHẤM CÔNG!\n" +
       "- Khi hỏi 'hướng dẫn đăng ký chuyển phát hồ sơ' hoặc 'chuyển phát hồ sơ/vật phẩm': CHỈ TRẢ LỜI 1 DÒNG hướng dẫn dùng lệnh '• */DeliverDocument* — Đăng ký chuyển phát hồ sơ'. TUYỆT ĐỐI KHÔNG IN LINK FORM HOẶC SHEET, KHÔNG IN LẠI WELCOME MESSAGE VÀ CẤM IN DÒNG THÔNG BÁO CHẤM CÔNG!\n" +
@@ -1447,6 +1647,7 @@ Bạn cần tôi hỗ trợ gì hôm nay? 🙋`;
       "  1. **Gõ lệnh trực tiếp trong chat:** `*/Penalty&Bonus @[Tên/Tag người dùng] +1 [Lý do]*` (Gõ `/Penalty&Bonus` rồi tag `@Tên` hoặc gõ `NickName` của người đó). Ví dụ: `*/Penalty&Bonus @Thủy Tiên +1 Hỗ trợ nhiệt tình*` hoặc `*/Penalty&Bonus 200.Tien +1 Hỗ trợ nhiệt tình*`.\n" +
       "  2. **Dùng biểu mẫu (Dialog):** Gõ `*/Penalty&Bonus*` (không kèm tham số) ➔ Chọn tên nhân viên trong danh sách ➔ Chọn số điểm (+1 / -1...) ➔ Nhập lý do.\n" +
       "  ❌ **CẤM TUYỆT ĐỐI:** CẤM hướng dẫn tag email (@email) vì hệ thống 200 AI chấm điểm bằng **TÊN/TAG NGƯỜI DÙNG** hoặc **NICK NAME**! CẤM tự sáng tác cú pháp lạ như `++/Penalty&Bonus`, `++/CEO.Son`, `+/...` hay bất kỳ cú pháp sai chuẩn nào!\n" +
+      "- **QUY TẮC CỐT LÕI VỀ CHÍNH XÁC THÔNG TIN (CẤM BỊA ĐẶT):** Nếu bạn không biết câu trả lời hoặc không tìm thấy dữ liệu trong các nguồn được cung cấp, chỉ cần nói rằng bạn không biết, đừng cố bịa ra câu trả lời cho tôi.\n" +
       "- Riêng câu hỏi thực sự về đi muộn, về sớm, quên chấm công hoặc phạt trừ công thì mới vào mục 'Dữ Liệu Chấm Công' kết hợp 'Quy Định Công Ty' và xử lý theo yêu cầu sau: " + promtp1;
 
     var answer = sendtoGemini(promtp)
@@ -1454,6 +1655,7 @@ Bạn cần tôi hỗ trợ gì hôm nay? 🙋`;
     // Chuyển **text** (Markdown chuẩn) → *text* (Google Chat bold syntax)
     answer = answer.replace(/\*\*([^*\n]+)\*\*/g, '*$1*')
 
+    logUserIngestionAsync(event, "GENERAL_QA", message, answer, new Date().getTime() - startTime);
     return { "text": answer };
 
   } catch (error) {
@@ -1937,9 +2139,9 @@ function dayreturn() {
  * Với Add-on Google Chat, execution limit thực tế ~30s → đặt deadline thấp để còn thời gian fallback.
  */
 var FALLBACK_MODELS = [
-  { name: "gemini-3.5-flash-lite", timeoutMs: 8000, deadlineMs: 6 },  // Model chính - chạy ổn định
+  { name: "gemini-3.1-flash-lite", timeoutMs: 8000, deadlineMs: 6 },  // Model chính - chạy ổn định
   { name: "gemini-2.5-flash-lite", timeoutMs: 8000, deadlineMs: 6 },  // Backup 1
-  { name: "gemini-3.1-flash-lite", timeoutMs: 8000, deadlineMs: 6 },  // Backup 2
+  { name: "gemini-3.5-flash-lite", timeoutMs: 8000, deadlineMs: 6 },  // Backup 2
   { name: "gemini-2.5-flash", timeoutMs: 8000, deadlineMs: 6 },       // Backup 3
 ];
 
@@ -2133,25 +2335,96 @@ function fetchGemsData() {
 //=============================================================================================================================================
 
 function getCompanyRules() {
-  try {
-    var docIds = [
-      "11Rid7PCqvrdR_UlXAKP0AGaGHzL5DcHs1kVgvZ1dE1k",
-    ];
-
-    var doc = DocumentApp.openById(docIds[0]);  // Mở file Google Docs
-    if (doc) {
-      return doc.getBody().getText();  // Lấy nội dung file
-    }
-  } catch (e) {
-    Logger.log("getCompanyRules warning: " + e.message);
-  }
-  return "";
+  // Document gốc đã bị xóa, chuyển sang dùng companyRule() hardcoded
+  return companyRule();
 }
 
 /**
  * Trích xuất danh sách tài liệu, link và nội dung từ Thư mục 210. Documents Management
  * Bao gồm: 211 (Company Legal Documents), 212 (Reporting contract), 213 (Passport/Visa), 214→219...
  */
+/**
+ * 💾 LƯU BỘ NHỚ ĐỆM DỮ LIỆU DUNG LƯỢNG LỚN (LƯU VÀO GOOGLE SHEET & CHUNKING PROPERTIES)
+ * Chống lỗi 50,000 ký tự / cell của Google Sheet & lỗi 9KB của PropertiesService.
+ */
+function saveLegalDocsCache(text) {
+  if (!text) return;
+
+  // 1. Lưu vào Google Sheet dưới dạng các HÀNG (Rows) trong Cột A (Tránh vượt quá 50,000 ký tự / cell)
+  try {
+    var ssId = typeof INGESTION_LOG_SPREADSHEET_ID !== 'undefined' ? INGESTION_LOG_SPREADSHEET_ID : '10Bb29mvsPseVmNySShF93hejqCxpJRon0YC2-NyMBnQ';
+    var ss = SpreadsheetApp.openById(ssId);
+    var sheet = ss.getSheetByName("Legal_Docs_Cache");
+    if (!sheet) {
+      sheet = ss.insertSheet("Legal_Docs_Cache");
+    }
+    sheet.clearContents();
+
+    var lines = text.split('\n');
+    var rows = lines.map(function (line) {
+      var strLine = String(line || '');
+      return [strLine.length > 40000 ? strLine.substring(0, 40000) : strLine];
+    });
+
+    if (rows.length > 0) {
+      sheet.getRange(1, 1, rows.length, 1).setValues(rows);
+    }
+  } catch (se) {
+    Logger.log("saveLegalDocsCache Sheet error: " + se.message);
+  }
+
+  // 2. Phân mảnh Chunking vào PropertiesService (Mỗi mảnh 8,000 ký tự)
+  try {
+    var props = PropertiesService.getScriptProperties();
+    var CHUNK_SIZE = 8000;
+    var totalChunks = Math.ceil(text.length / CHUNK_SIZE);
+    props.setProperty("LEGAL_DOCS_CHUNK_COUNT", totalChunks.toString());
+    for (var c = 0; c < Math.min(totalChunks, 40); c++) {
+      var chunk = text.substring(c * CHUNK_SIZE, (c + 1) * CHUNK_SIZE);
+      props.setProperty("LEGAL_DOCS_CHUNK_" + c, chunk);
+    }
+  } catch (pe) {
+    Logger.log("saveLegalDocsCache Properties error: " + pe.message);
+  }
+}
+
+/**
+ * 📖 ĐỌC BỘ NHỚ ĐỆM DỮ LIỆU DUNG LƯỢNG LỚN
+ */
+function loadLegalDocsCache() {
+  // 1. Đọc từ PropertiesService (Chunking)
+  try {
+    var props = PropertiesService.getScriptProperties();
+    var countStr = props.getProperty("LEGAL_DOCS_CHUNK_COUNT");
+    if (countStr) {
+      var count = parseInt(countStr);
+      var result = "";
+      for (var i = 0; i < count; i++) {
+        var chunk = props.getProperty("LEGAL_DOCS_CHUNK_" + i);
+        if (chunk) result += chunk;
+      }
+      if (result && result.trim() !== "") return result;
+    }
+  } catch (pe) { }
+
+  // 2. Dự phòng: Đọc từ tab Sheet "Legal_Docs_Cache" (Các hàng Cột A)
+  try {
+    var ssId = typeof INGESTION_LOG_SPREADSHEET_ID !== 'undefined' ? INGESTION_LOG_SPREADSHEET_ID : '10Bb29mvsPseVmNySShF93hejqCxpJRon0YC2-NyMBnQ';
+    var ss = SpreadsheetApp.openById(ssId);
+    var sheet = ss.getSheetByName("Legal_Docs_Cache");
+    if (sheet) {
+      var values = sheet.getDataRange().getValues();
+      if (values && values.length > 0) {
+        var lines = values.map(function (r) { return r[0]; });
+        var text = lines.join('\n');
+        if (text && text.trim() !== "") return text;
+      }
+    }
+  } catch (se) { }
+
+  return null;
+}
+
 function getFolder211LegalDocsData() {
   try {
     var cacheKey = "LEGAL_DOCS_211_CACHE_V2";
@@ -2160,6 +2433,14 @@ function getFolder211LegalDocsData() {
       if (cached) return cached;
     } catch (ce) { }
 
+    // 1. Ưu tiên lấy từ bộ lưu trữ vĩnh viễn (được quét tự động ngầm qua Trigger)
+    var permCached = loadLegalDocsCache();
+    if (permCached && permCached.trim() !== "") {
+      try { CacheService.getScriptCache().put(cacheKey, permCached.substring(0, 90000), 21600); } catch (e) { }
+      return permCached;
+    }
+
+    // 2. Nếu chưa có dữ liệu quét ngầm, tiến hành quét nhanh trực tiếp trong giới hạn an toàn (<2.5s)
     var folderId = '0B_q5HyYkeLftU1NNSzhDWnRYVzA'; // Folder 210. Documents Management
     var parentFolder = null;
     try {
@@ -2174,13 +2455,17 @@ function getFolder211LegalDocsData() {
     var lines = [];
     lines.push("------------------- Danh sách Văn bản / Tài liệu Thư mục 210 (Documents Management: 211→219) -------------------");
 
+    var startTime = new Date().getTime();
+    var fileCount = 0;
+
     function scanFolder(folder, pathPrefix) {
       if (!folder) return;
+      if (new Date().getTime() - startTime > 2500 || fileCount >= 40) return; // Chặn timeout 2.5s khi chạy trực tiếp
 
-      // 1. Quét File trong folder hiện tại
       try {
         var files = folder.getFiles();
         while (files && files.hasNext()) {
+          if (new Date().getTime() - startTime > 2500 || fileCount >= 40) break;
           try {
             var file = files.next();
             if (!file) continue;
@@ -2200,9 +2485,10 @@ function getFolder211LegalDocsData() {
             lines.push("- Tài liệu: \"" + fName + "\" | Vị trí công ty/bộ phận: " + fullPath);
             lines.push("  Link xem: " + fUrl);
             if (textContent) {
-              var snippet = textContent.replace(/\s+/g, ' ').substring(0, 2000);
+              var snippet = textContent.replace(/\s+/g, ' ').substring(0, 1000);
               lines.push("  Trích yếu nội dung: " + snippet);
             }
+            fileCount++;
           } catch (fileErr) {
             Logger.log("Error processing individual file in " + pathPrefix + ": " + fileErr.message);
           }
@@ -2211,10 +2497,10 @@ function getFolder211LegalDocsData() {
         Logger.log("Error getting files in " + pathPrefix + ": " + filesErr.message);
       }
 
-      // 2. Quét SubFolders
       try {
         var subFolders = folder.getFolders();
         while (subFolders) {
+          if (new Date().getTime() - startTime > 2500 || fileCount >= 40) break;
           try {
             if (!subFolders.hasNext()) break;
             var sub = subFolders.next();
@@ -2234,16 +2520,95 @@ function getFolder211LegalDocsData() {
     scanFolder(parentFolder, "210. Documents Management");
 
     var resultText = lines.join('\n');
-
-    try {
-      CacheService.getScriptCache().put(cacheKey, resultText, 600); // Cache 10 phút
-    } catch (ce) { }
+    saveLegalDocsCache(resultText);
 
     return resultText;
   } catch (error) {
     Logger.log("Error in getFolder211LegalDocsData: " + error.toString());
     return "Không thể truy cập Thư mục 211 (1oDhTJUEmdICreryjojxuMisUVXT09jPD) hoặc thiếu quyền Drive.\n";
   }
+}
+
+/**
+ * 🔄 HÀM QUÉT NGẦM KHÔNG GIỚI HẠN THỜI GIAN (BẰNG TRIGGER TỰ ĐỘNG)
+ * Chạy ngầm trên máy chủ Google Apps Script (tối đa 6 phút), không bị giới hạn 30s của Google Chat!
+ */
+function refreshLegalDocsCacheTrigger() {
+  Logger.log("[Background Trigger] 🔄 Bắt đầu quét toàn bộ Thư mục 210 ngầm...");
+  var folderId = '0B_q5HyYkeLftU1NNSzhDWnRYVzA';
+  var parentFolder = null;
+  try { parentFolder = DriveApp.getFolderById(folderId); } catch (e) { return; }
+  if (!parentFolder) return;
+
+  var lines = [];
+  lines.push("------------------- Danh sách Văn bản / Tài liệu Thư mục 210 (Documents Management: 211→219) -------------------");
+
+  function scanFolderFull(folder, pathPrefix) {
+    if (!folder) return;
+    try {
+      var files = folder.getFiles();
+      while (files && files.hasNext()) {
+        try {
+          var file = files.next();
+          if (!file) continue;
+          var fName = file.getName();
+          var fUrl = file.getUrl();
+          var fMime = file.getMimeType();
+          var fullPath = pathPrefix ? (pathPrefix + " > " + fName) : fName;
+
+          var textContent = "";
+          if (fMime === MimeType.GOOGLE_DOCS) {
+            try {
+              var doc = DocumentApp.openById(file.getId());
+              if (doc) textContent = doc.getBody().getText();
+            } catch (de) { }
+          }
+
+          lines.push("- Tài liệu: \"" + fName + "\" | Vị trí công ty/bộ phận: " + fullPath);
+          lines.push("  Link xem: " + fUrl);
+          if (textContent) {
+            var snippet = textContent.replace(/\s+/g, ' ').substring(0, 1000);
+            lines.push("  Trích yếu nội dung: " + snippet);
+          }
+        } catch (e) { }
+      }
+    } catch (e) { }
+
+    try {
+      var subFolders = folder.getFolders();
+      while (subFolders && subFolders.hasNext()) {
+        var sub = subFolders.next();
+        if (sub) scanFolderFull(sub, pathPrefix ? (pathPrefix + " > " + sub.getName()) : sub.getName());
+      }
+    } catch (e) { }
+  }
+
+  scanFolderFull(parentFolder, "210. Documents Management");
+  var resultText = lines.join('\n');
+
+  try {
+    saveLegalDocsCache(resultText);
+    Logger.log("[Background Trigger] ✅ Đã hoàn tất quét ngầm toàn bộ Thư mục 210! Đã lưu vĩnh viễn dữ liệu (" + resultText.length + " ký tự) vào Google Sheet & Properties.");
+  } catch (e) {
+    Logger.log("[Background Trigger] Error saving cache: " + e.message);
+  }
+}
+
+/**
+ * ⏰ THIẾT LẬP TRIGGER TỰ ĐỘNG QUÉT NGẦM MỖI 1 GIỜ
+ */
+function setupLegalDocsHourlyTrigger() {
+  var triggers = ScriptApp.getProjectTriggers();
+  for (var i = 0; i < triggers.length; i++) {
+    if (triggers[i].getHandlerFunction() === 'refreshLegalDocsCacheTrigger') {
+      ScriptApp.deleteTrigger(triggers[i]);
+    }
+  }
+  ScriptApp.newTrigger('refreshLegalDocsCacheTrigger')
+    .timeBased()
+    .everyHours(1)
+    .create();
+  Logger.log("✅ Đã tạo Trigger quét ngầm tự động mỗi 1 giờ!");
 }
 
 /*
@@ -3533,15 +3898,65 @@ function submitDialogVPP(event) {
 
     sheet1.insertRows(3, 1);
 
-    sheet1.getRange("A3").setValue(getCurrentFormattedDate())
-    sheet1.getRange("B3").setValue(user)
-    sheet1.getRange("C3").setValue(vpp)
-    sheet1.getRange("D3").setValue(quantity)
-    sheet1.getRange("F3").setValue(link)
+    const timestamp = getCurrentFormattedDate();
+    sheet1.getRange("A3").setValue(timestamp);
+    sheet1.getRange("B3").setValue(user);
+    sheet1.getRange("C3").setValue(vpp);
+    sheet1.getRange("D3").setValue(quantity);
+    sheet1.getRange("F3").setValue(link);
 
-    var mess = "Bạn đã đăng ký thành công ✅ <https://docs.google.com/spreadsheets/d/10Czvm2uyipN67r39h8_I6c3kVBMZTOE7dS8jwIa-QUQ/edit?gid=617945518#gid=617945518|Xem chi tiết>"
-    sendMessageByChatBot({ text: mess }, space)
-    sendEmail('200announcement@planadd.com', user, vpp, quantity, link)
+    var vppSheetUrl = "https://docs.google.com/spreadsheets/d/10Czvm2uyipN67r39h8_I6c3kVBMZTOE7dS8jwIa-QUQ/edit?gid=617945518#gid=617945518";
+
+    // ── Gửi Card thông báo trực tiếp từ 200AI với định dạng đẹp (CardsV2) thay cho Email ──
+    var notifyWidgets = [
+      { textParagraph: { text: '- <b>Người đăng ký</b>: ' + user } },
+      { textParagraph: { text: '- <b>Văn phòng phẩm</b>: ' + vpp } },
+      { textParagraph: { text: '- <b>Số lượng</b>: ' + quantity } }
+    ];
+    if (link && link.trim() !== '') {
+      notifyWidgets.push({ textParagraph: { text: '- <b>Link sản phẩm</b>: ' + link } });
+    }
+    notifyWidgets.push({
+      buttonList: {
+        buttons: [{
+          text: '📊 Xem Google Sheet',
+          onClick: { openLink: { url: vppSheetUrl } }
+        }]
+      }
+    });
+
+    var notifyMsg = {
+      cardsV2: [{
+        card: {
+          header: {
+            title: '🧷 OFFICE SUPPLIES',
+            subtitle: '⏳ ' + timestamp,
+            imageUrl: 'https://fonts.gstatic.com/s/i/short-term/release/googlesymbols/edit_note/default/24px.svg'
+          },
+          sections: [{
+            widgets: notifyWidgets
+          }],
+          fixedFooter: {
+            primaryButton: {
+              text: 'Xem Google Sheet',
+              onClick: {
+                openLink: {
+                  url: vppSheetUrl
+                }
+              }
+            }
+          }
+        }
+      }]
+    };
+
+    // 1. Gửi Card V2 định dạng đẹp vào khung chat của người dùng khi đăng ký thành công
+    if (space && space !== 'spaces/AAQA2_sKqYQ') {
+      sendMessageByChatBot(notifyMsg, space);
+    }
+
+    // 2. Gửi Card V2 định dạng đẹp tới nhóm 200.Notification (spaces/AAQA2_sKqYQ)
+    sendMessageByChatBot(notifyMsg, 'spaces/AAQA2_sKqYQ');
 
     return {
       actionResponse: {
@@ -5521,6 +5936,7 @@ Trong thời gian 3 tháng kể từ ngày bị khiển trách bằng văn bản
 1. Người lao động có hành vi trộm cắp, tham ô, đánh bạc, cố ý gây thương tích, sử dụng ma túy trong phạm vi nơi làm việc, tiết lộ bí mật kinh doanh, bí mật công nghệ, có hành vi gây thiệt hại nghiêm trọng hoặc đe dọa gây thiệt hại đặc biệt nghiêm trọng về tài sản, lợi ích của người sử dụng lao động hoặc quấy rối tình dục tại nơi làm việc được quy định trong nội quy lao động.
 2. Người lao động bị xử lý kỷ luật kéo dài thời hạn xem xét nâng lương hoặc cách chức mà tái phạm trong thời gian chưa xóa kỷ luật.
 3. Người lao động tự ý bỏ việc 05 ngày cộng dồn trong thời hạn 30 ngày hoặc 20 ngày làm việc cộng dồn trong thời hạn 365 ngày kể từ ngày đầu tiên tự ý bỏ việc mà không có lý do chính đáng.
+
 CHƯƠNG 11 [QUY TRÌNH MUA HÀNG - THANH TOÁN]
 1. Quy trình mua hàng - Thanh toán
 Ảnh quy trình mua hàng - thanh toán: https://drive.google.com/file/d/1E-8j5b583n5aXD-FaHRckTGAzmajRbp9/view?usp=drive_link 
@@ -5577,7 +5993,7 @@ Chi phí hỗ trợ xăng xe: lập bảng chi tiết chặng đường di chuy�
  *   - 5 trường bắt buộc: Tên & mã dự án, Tên tài liệu, Số tài liệu, Số bản, Địa điểm
  *   - Dấu tròn (RADIO — chỉ chọn 1): ADD Group, VPA, TYM, CESS, ADD Con, VPAHCM, WORKSMATE
  *   - Dấu chữ ký / chức danh (CHECKBOX — nhiều): Boss' signature, Boss' title,
- *       Ms.Huong's signature, Mrs.Huong's title, Madam Kim's title
+ *       Ms.Huong's signature, Ms.Huong's title, Madam Kim's title
  *   - Dấu khác (CHECKBOX — nhiều): Appraisal Stamp, Asbuilt Stamp
  */
 function buildStampDocumentDialog() {
@@ -5679,7 +6095,8 @@ function buildStampDocumentDialog() {
                   { text: "Boss' signature — Dấu chữ ký Boss", value: "Boss' signature — Dấu chữ ký Boss", selected: false },
                   { text: "Boss' title — Dấu chức danh Boss", value: "Boss' title — Dấu chức danh Boss", selected: false },
                   { text: "Ms.Huong's signature — Dấu chữ ký Ms. Hương", value: "Ms.Huong's signature — Dấu chữ ký Ms. Hương", selected: false },
-                  { text: "Mrs.Huong's title — Dấu chức danh Mrs. Hương", value: "Mrs.Huong's title — Dấu chức danh Mrs. Hương", selected: false },
+                  { text: "Ms.Huong's title — Dấu chức danh Ms. Hương", value: "Ms.Huong's title — Dấu chức danh Ms. Hương", selected: false },
+                  { text: "Mr.Thuyết's title — Dấu chức danh Mr. Thuyết", value: "Mr.Thuyết's title — Dấu chức danh Mr. Thuyết", selected: false },
                   { text: "Madam Kim's title — Dấu chức danh Madam Kim", value: "Madam Kim's title — Dấu chức danh Madam Kim", selected: false }
                 ]
               }
@@ -5953,6 +6370,255 @@ function submitStampDocument(event) {
     };
   }
 }
+// ============================== FORM LINKS (CHƯƠNG 3 – CÁC ĐƯỜNG LINK, FORM MẪU CHUNG) ==============================
+/**
+ * Danh sách form mẫu chung từ CHƯƠNG 3 – nội quy công ty.
+ * Mỗi entry gồm: keywords (mảng từ khóa nhận dạng) và url (đường link trực tiếp).
+ */
+var COMPANY_FORM_LINKS = [
+  {
+    name: 'Form đề nghị thanh toán online của ADD',
+    keywords: ['đề nghị thanh toán', 'thanh toán online add', 'form thanh toán add', 'thanh toán add', 'payment add', 'đề nghị thanh toán add'],
+    url: 'https://docs.google.com/forms/d/e/1FAIpQLSdxe1Ys-EBR473wpqbr_0HIL4Wr0S4A9G6xE8sT-CZmT-gNoQ/viewform?pli=1'
+  },
+  {
+    name: 'Form đề nghị thanh toán online của VPA',
+    keywords: ['thanh toán vpa', 'form thanh toán vpa', 'đề nghị thanh toán vpa', 'payment vpa', 'thanh toán online vpa'],
+    url: 'https://docs.google.com/forms/d/e/1FAIpQLSe1RL2H8ETmaz2adT7PJMUdxMxkFjZiKDbfuEpnMIfbv_g0nw/viewform?pli=1'
+  },
+  {
+    name: 'Form đăng ký mua văn phòng phẩm',
+    keywords: ['văn phòng phẩm', 'vpp', 'mua văn phòng phẩm', 'form vpp', 'đăng ký vpp', 'office supply', 'officesupply'],
+    url: 'https://docs.google.com/spreadsheets/d/10Czvm2uyipN67r39h8_I6c3kVBMZTOE7dS8jwIa-QUQ/edit?usp=sharing'
+  },
+  {
+    name: 'Form đề nghị làm thêm giờ',
+    keywords: ['làm thêm giờ', 'tăng ca', 'ot', 'overtime', 'form tăng ca', 'đăng ký tăng ca', 'form ot', 'làm thêm'],
+    url: 'https://docs.google.com/forms/d/e/1FAIpQLSfAo1y1wvJXqFjfBVdUAT5hUaPuH9BIdERLvYDjLImj9qmXwQ/viewform'
+  },
+  {
+    name: 'Schedule Form – tiến độ công việc',
+    keywords: ['schedule form', 'tiến độ công việc', 'lịch công việc', 'tiến độ dự án', 'schedule', 'kế hoạch công việc'],
+    url: 'https://docs.google.com/spreadsheets/d/1_Vs44xzlsuK-A0dB9wYuZo27GQ2ySQUwcWQgX6olr1Y/edit?usp=sharing'
+  },
+  {
+    name: 'Form báo cáo cuộc họp (Meeting report)',
+    keywords: ['báo cáo cuộc họp', 'meeting report', 'biên bản cuộc họp', 'họp', 'meeting', 'form họp'],
+    url: 'https://docs.google.com/spreadsheets/d/1o8JoVz4wiad_t4Rd1jwKWzPmToDaqcOQs1HPJY4GFRc/edit?gid=923456535#gid=923456535'
+  },
+  {
+    name: 'Biên bản bàn giao hồ sơ',
+    keywords: ['biên bản bàn giao hồ sơ', 'ban giao ho so', 'bàn giao hồ sơ'],
+    url: 'https://docs.google.com/document/d/1VKoHv-cZWJ5CEalfpicM9kEZzLeDjwc-_5vj41a0L6Q/edit?tab=t.0'
+  },
+  {
+    name: 'Bảng báo giá thiết kế',
+    keywords: ['báo giá thiết kế', 'báo giá', 'bảng báo giá', 'thiết kế', 'quotation design'],
+    url: 'https://docs.google.com/spreadsheets/d/14FV5b7pdufZQdDkqgbD64tlsiHA2t9W22WulsGjjCwQ/edit?usp=sharing'
+  },
+  {
+    name: 'Báo cáo giám sát đầu tư',
+    keywords: ['giám sát đầu tư', 'báo cáo đầu tư', 'investment report', 'báo cáo giám sát'],
+    url: 'https://docs.google.com/document/d/1waep2V9LD_2JUa2E4EhRm0Qz7-3yo_RWd7ddlwQxBjQ/edit?tab=t.0'
+  },
+  {
+    name: 'Biên nhận tiền',
+    keywords: ['biên nhận tiền', 'nhận tiền', 'biên nhận', 'receipt'],
+    url: 'https://docs.google.com/spreadsheets/d/1klLDvMQeAbTGzb385kCfZPz2E003ATjBE7A97dTRWw0/edit?gid=444784611#gid=444784611'
+  },
+  {
+    name: 'Đề nghị hoàn ứng',
+    keywords: ['hoàn ứng', 'đề nghị hoàn ứng', 'form hoàn ứng', 'hoan ung'],
+    url: 'https://docs.google.com/spreadsheets/d/1czGIu08W4R_9ig1PdZMGDJA-thQKLIWZjgxwGuaAA4k/edit?gid=980403237#gid=980403237'
+  },
+  {
+    name: 'Đề nghị tạm ứng',
+    keywords: ['tạm ứng', 'đề nghị tạm ứng', 'form tạm ứng', 'tam ung'],
+    url: 'https://docs.google.com/spreadsheets/d/1R4Rgj8W5ghKMfK3E4KNdgnB1dpvAZBys80u_qAQ1KW0/edit?usp=sharing'
+  },
+  {
+    name: 'Đơn xin nghỉ phép',
+    keywords: ['đơn nghỉ phép', 'đơn xin nghỉ phép', 'form nghỉ phép', 'xin nghỉ phép', 'don nghi phep'],
+    url: 'https://docs.google.com/document/d/1fm_PRf0zIFyYBhYVPyO10ceEPCxV8AWcACDdZiJOgwk/edit?usp=sharing'
+  },
+  {
+    name: 'Đơn xin nghỉ việc',
+    keywords: ['đơn nghỉ việc', 'đơn xin nghỉ việc', 'form nghỉ việc', 'xin nghỉ việc', 'don nghi viec', 'thôi việc'],
+    url: 'https://docs.google.com/document/d/1_rshuPSWNxTh18FRAJQ6WNIPPU2bMVc8al_-Aziw8XI/edit?usp=sharing'
+  },
+  {
+    name: 'Đơn nghỉ thai sản',
+    keywords: ['thai sản', 'nghỉ thai sản', 'đơn thai sản', 'maternity leave', 'don thai san'],
+    url: 'https://docs.google.com/document/d/1komIN7xQH4ZzrzAj58nbHEDfHsbtMl9ACUohZTPcgOA/edit?usp=sharing'
+  },
+  {
+    name: 'Mẫu hồ sơ nhân viên',
+    keywords: ['hồ sơ nhân viên', 'mẫu nhân viên', 'hồ sơ tuyển dụng', 'mau ho so nhan vien', 'profile nhân viên'],
+    url: 'https://docs.google.com/spreadsheets/d/1oyKTdbTNqeba_juvskDGDueucPco3OQdsPQ4nnav9DM/edit?gid=374638353#gid=374638353'
+  },
+  {
+    name: 'Thỏa thuận chấm dứt hợp đồng',
+    keywords: ['thỏa thuận chấm dứt', 'chấm dứt hợp đồng thỏa thuận', 'thoa thuan cham dut'],
+    url: 'https://docs.google.com/spreadsheets/d/1sFLPT5bRvdLpc3spd2fcYKw5sESMxdmQm_HacRVYT78/edit?gid=1222850533#gid=1222850533'
+  },
+  {
+    name: 'Đăng ký đổi khung giờ làm việc',
+    keywords: ['đổi khung giờ', 'khung giờ làm việc', 'đăng ký giờ', 'đổi giờ làm', 'form đổi giờ', 'change working hours'],
+    url: 'https://docs.google.com/spreadsheets/d/1Tg3tU2ILUvTSt7S9RJaPLhipOnXkO0xqEimbiEb9N30/edit?gid=2026000455#gid=2026000455'
+  },
+  {
+    name: 'Biên bản vụ việc',
+    keywords: ['biên bản vụ việc', 'bien ban vu viec', 'incident report', 'vụ việc'],
+    url: 'https://docs.google.com/document/d/1w8szPvWJVqSGW0ERshLma7n9FKCDjEGnUbHxDwqGRQE/edit?tab=t.0'
+  },
+  {
+    name: 'Biên bản bàn giao công việc',
+    keywords: ['bàn giao công việc', 'biên bản bàn giao công việc', 'handover', 'ban giao cong viec'],
+    url: 'https://docs.google.com/spreadsheets/d/1SdZUI8k4keP1SatVjKeQVelTz5vbO7iGJCnUx0_Yo7U/edit?gid=1801370334#gid=1801370334'
+  },
+  {
+    name: 'Thông báo chấm dứt Hợp đồng lao động',
+    keywords: ['thông báo chấm dứt hợp đồng lao động', 'thông báo chấm dứt hdld', 'notice of termination'],
+    url: 'https://docs.google.com/document/d/1wUUsxsRiPRL8-cj1Yz5FZv23WXylJ0Doux3nXqxUCGI/edit?tab=t.0'
+  },
+  {
+    name: 'Quyết định chấm dứt Hợp đồng lao động',
+    keywords: ['quyết định chấm dứt hợp đồng lao động', 'quyết định chấm dứt hdld', 'decision of termination'],
+    url: 'https://docs.google.com/document/d/15wAmSmijd99MshV8rfdd0dedcBqCk9oTVXDn5hl1TSQ/edit?tab=t.0'
+  },
+  {
+    name: 'Biên bản bàn giao tài sản',
+    keywords: ['bàn giao tài sản', 'biên bản bàn giao tài sản', 'asset handover', 'ban giao tai san'],
+    url: 'https://docs.google.com/spreadsheets/d/1CIUmmnq7u9Ozluyv1rG3gyB2y5X7mB2uEJoe0DvzmLQ/edit?gid=707200935#gid=707200935'
+  },
+  {
+    name: 'Giấy giới thiệu',
+    keywords: ['giấy giới thiệu', 'giay gioi thieu', 'introduction letter', 'letter of introduction'],
+    url: 'https://docs.google.com/document/d/0Bw_u1f220kn1WEdfTUk3NDNEblU/edit?resourcekey=0-y0DtHIX_Ij4Lo9ssEzvksw'
+  },
+  {
+    name: 'Giấy ủy quyền',
+    keywords: ['giấy ủy quyền', 'ủy quyền', 'giay uy quyen', 'power of attorney', 'authorization letter'],
+    url: 'https://docs.google.com/document/d/1_lYrwtr7oLxMt4eDD7cfJDuoCSWO2SoBu2Rqt9Reses/edit?tab=t.0'
+  },
+  {
+    name: 'Mẫu công văn',
+    keywords: ['mẫu công văn', 'công văn', 'cong van', 'official letter', 'form công văn'],
+    url: 'https://docs.google.com/document/d/1yPln3KUOJeWJ_8rlLWudChQxF5bPqSW6lTIMZX6iFDQ/edit?tab=t.0'
+  },
+  {
+    name: 'Biên bản giao nhận hồ sơ',
+    keywords: ['biên bản giao nhận hồ sơ', 'giao nhận hồ sơ', 'bien ban giao nhan ho so'],
+    url: 'https://docs.google.com/spreadsheets/d/1bB5ub5kA37w2qR40RI2tFfgMl01YZYuf9jgYDfb2yVI/edit?gid=0#gid=0'
+  },
+  {
+    name: 'Form đăng ký mượn tài liệu, hồ sơ',
+    keywords: ['mượn tài liệu', 'mượn hồ sơ', 'đăng ký mượn', 'muon tai lieu', 'muon ho so', 'borrow documents'],
+    url: 'https://forms.gle/NA8HX2ARpWuAQFrS7'
+  }
+];
+
+/**
+ * Kiểm tra xem câu hỏi có phải là hỏi về form/link mẫu chung trong CHƯƠNG 3 hay không.
+ * Ưu tiên xử lý TRƯỚC khi đẩy vào Drive Search.
+ */
+function isFormLinkRequest(text) {
+  if (!text) return false;
+  var lower = removeAccents(text.toLowerCase().trim());
+
+  // Phải có từ khóa ý định hỏi link/form
+  var intentPattern = /\b(form|link|m[aă]u|where|cho t[ôo]i|d[aă]u|[aă]o d[aâ]u|t[aà]i li[eê]u|mượn|bieu mau|mau|h[oô] s[oơ]|don)\b/i;
+  if (!intentPattern.test(lower)) return false;
+
+  // Kiểm tra trong danh sách COMPANY_FORM_LINKS
+  for (var i = 0; i < COMPANY_FORM_LINKS.length; i++) {
+    var entry = COMPANY_FORM_LINKS[i];
+    for (var k = 0; k < entry.keywords.length; k++) {
+      var kw = removeAccents(entry.keywords[k].toLowerCase());
+      if (lower.indexOf(kw) !== -1) return true;
+    }
+  }
+  return false;
+}
+
+/**
+ * Xử lý câu hỏi về form/link mẫu chung từ CHƯƠNG 3.
+ * Trả về tất cả form khớp với từ khóa trong câu hỏi.
+ */
+function handleFormLinkRequest(text, displayName) {
+  var lower = removeAccents(text.toLowerCase().trim());
+  var matched = [];
+
+  for (var i = 0; i < COMPANY_FORM_LINKS.length; i++) {
+    var entry = COMPANY_FORM_LINKS[i];
+    for (var k = 0; k < entry.keywords.length; k++) {
+      var kw = removeAccents(entry.keywords[k].toLowerCase());
+      if (lower.indexOf(kw) !== -1) {
+        matched.push(entry);
+        break;
+      }
+    }
+  }
+
+  if (matched.length === 0) return null;
+
+  // Nếu chỉ 1 kết quả → trả link trực tiếp
+  if (matched.length === 1) {
+    var f = matched[0];
+    return {
+      cardsV2: [{
+        card: {
+          header: {
+            title: '📋 FORM MẪU CHUNG',
+            subtitle: 'Dành cho ' + displayName,
+            imageUrl: 'https://fonts.gstatic.com/s/i/short-term/release/googlesymbols/article/default/24px.svg'
+          },
+          sections: [{
+            widgets: [
+              { textParagraph: { text: '<b>' + f.name + '</b>' } },
+              {
+                buttonList: {
+                  buttons: [{
+                    text: '🔗 Mở Form / Tài liệu',
+                    onClick: { openLink: { url: f.url } },
+                    color: { red: 0.1, green: 0.53, blue: 0.82, alpha: 1 }
+                  }]
+                }
+              }
+            ]
+          }]
+        }
+      }]
+    };
+  }
+
+  // Nhiều kết quả → liệt kê dưới dạng danh sách với nút bấm cho từng form
+  var widgets = [{ textParagraph: { text: '✅ Tìm thấy <b>' + matched.length + '</b> tài liệu phù hợp:' } }];
+  for (var j = 0; j < matched.length; j++) {
+    var fm = matched[j];
+    widgets.push({
+      buttonList: {
+        buttons: [{
+          text: '📄 ' + fm.name,
+          onClick: { openLink: { url: fm.url } }
+        }]
+      }
+    });
+  }
+
+  return {
+    cardsV2: [{
+      card: {
+        header: {
+          title: '📋 FORM MẪU CHUNG',
+          subtitle: 'Kết quả cho: ' + displayName,
+          imageUrl: 'https://fonts.gstatic.com/s/i/short-term/release/googlesymbols/article/default/24px.svg'
+        },
+        sections: [{ widgets: widgets }]
+      }
+    }]
+  };
+}
 
 // ============================== GOOGLE CHAT LINK AGENT (DRIVE SEARCH) ==============================
 var DRIVE_ROOT_FOLDER_URL = "https://drive.google.com/drive/folders/0B_q5HyYkeLftU1NNSzhDWnRYVzA?resourcekey=0-FmSJ1KEXM9RveZhA52ikbg";
@@ -5961,9 +6627,9 @@ var DRIVE_ROOT_RESOURCE_KEY = "0-1nMkZNSFxT89iKtAWEsleQ";
 
 var LINK_TRIGGER_KEYWORDS = [
   "link", "tài liệu", "file", "folder", "thư mục", "drive",
-  "tìm", "lấy", "gửi", "cho tôi", "ở đâu", "chỗ nào", "tìm giúp",
-  "cần link", "cần file", "điều lệ", "quyết định", "giấy phép",
-  "hợp đồng", "sổ đỏ", "báo cáo", "quy định", "211",
+  "cần link", "cần file", "tìm file", "tìm tài liệu", "tìm link", "lấy file", "gửi link",
+  "điều lệ", "quyết định", "giấy phép",
+  "hợp đồng", "sổ đỏ", "báo cáo", "211",
   "210", "220", "230", "240", "250", "260", "270", "280", "290",
   "erc", "irc", "đăng ký kinh doanh", "nhãn hiệu", "đấu thầu",
   "con dấu", "chữ ký", "nhân sự", "tài sản", "văn phòng",
@@ -5977,8 +6643,19 @@ function isLinkRequest(text) {
   if (!text) return false;
   var lower = text.toLowerCase().trim();
 
-  // Bỏ qua nếu đây là câu hỏi về Penalty & Bonus, Ngày phép, hoặc Chấm công để không bị nhầm thành tìm file Drive
-  if (/penalty|bonus|phạt|thưởng|tim|bom|❤️|💣|điểm|đánh giá|phép|phéo|vacation|leave|nghỉ|chấm công|dữ liệu chấm công|muộn|trễ|quên|về sớm|tổng công|công tháng|checkin|checkout/.test(lower)) {
+  // Bỏ qua nếu đây là câu hỏi về Penalty & Bonus, Ngày phép, Chấm công, Ngày công, Đi muộn, Vệ sinh, Vé máy bay... để không bị nhầm thành tìm file Drive
+  if (/penalty|bonus|phạt|thưởng|tim|bom|❤️|💣|điểm|đánh giá|phép|phéo|vacation|leave|nghỉ|chấm công|dữ liệu chấm công|muộn|trễ|quên|về sớm|tổng công|ngày công|số công|công tháng|đi làm|checkin|checkout|vé máy bay|lịch bay|ngày bay|chuyến bay|vé bay|vé sếp|lịch sếp|sếp bay|madam|flight|vệ sinh|dọn dẹp/.test(lower)) {
+    return false;
+  }
+
+  // 🌟 NẾU LÀ CÂU HỎI TRÍCH XUẤT THÔNG TIN / CHỈ SỐ DOANH NGHIỆP (Mã số thuế, vốn điều lệ, người đại diện...) -> Kích hoạt ngay luồng Drive Search & AI Extraction
+  if (typeof isInfoExtractionRequest === 'function' && isInfoExtractionRequest(lower)) {
+    return true;
+  }
+
+  // Bỏ qua các câu hỏi giao tiếp hoặc thắc mắc quy chế/thử việc thông thường không chỉ định file
+  if (!/link|tài liệu|file|folder|thư mục|drive|211|erc|irc|sổ đỏ|báo cáo|điều lệ|hợp đồng|giấy phép/i.test(lower)) {
+    // Nếu không chứa các từ chỉ định tài liệu/file cụ thể thì KHÔNG đẩy vào Drive Search
     return false;
   }
 
@@ -5989,17 +6666,19 @@ function isLinkRequest(text) {
 }
 
 function isInfoExtractionRequest(text) {
-  if (!text) return false;
-  var lower = text.toLowerCase().trim();
+  if (!text) return false;  var lower = text.toLowerCase().trim();
 
-  // 1. Tiếng Việt (Bao gồm từ khóa trích xuất thông tin + Thời hạn / Ngày hết hạn / Hiệu lực...)
-  var viPattern = /mã số|mã số thuế|msdn|mst|vốn|điều lệ|góp vốn|thành viên|cổ đông|cổ phần|tỷ lệ|phần vốn|địa chỉ|trụ sở|người đại diện|đại diện|giám đốc|chủ sở hữu|ngày cấp|nội dung|chi tiết|trích xuất|cho biết|cho tôi biết|là bao nhiêu|bao nhiêu|ở đâu|đăng ký lần đầu|đăng ký thay đổi|đại diện pháp luật|ai là|ai đứng tên|thông tin|thoogn|thong tin|tin tuc|thông tin về|hết hạn|thời hạn|hiệu lực|khi nào|bao giờ|ngày hết hạn|hạn hoạt động|thời gian hoạt động|giá trị đến|còn hạn|quá hạn|hết hiệu lực|bao nhiêu năm|mấy năm|hạn đến/i;
+  // Bỏ qua nếu là câu xin/tìm file đơn thuần (VD: "cho tôi ERC của VPA", "tìm file ERC", "gửi link ERC")
+  // CHỈ kích hoạt AI trích xuất thông tin khi người dùng hỏi các chi tiết / chỉ số cụ thể bên trong tài liệu.
 
-  // 2. Tiếng Hàn (Korean: 주주 - cổ đông, 지분율 - tỷ lệ, 대표 - đại diện, 자본금 - vốn, 주소 - địa chỉ, 누구 - ai, 어떻게 - như thế nào, 만기 - hết hạn, 만료 - hết hạn...)
-  var koPattern = /주주|지분|지분율|대표|대표자|자본|자본금|주소|등록번호|법인|내용|정보|누구|어떻게|얼마|어디|원|퍼센트|%|만기|유효|기간|언제|만료/i;
+  // 1. Tiếng Việt: Các từ khóa hỏi THÔNG TIN CỤ THỂ bên trong tài liệu (Mã số, Vốn, Người đại diện, Thời hạn...)
+  var viPattern = /mã số|mã số thuế|msdn|mst|vốn|vốn điều lệ|góp vốn|thành viên|cổ đông|cổ phần|tỷ lệ|phần vốn|địa chỉ|trụ sở|người đại diện|đại diện|giám đốc|chủ sở hữu|ngày cấp|đăng ký lần đầu|đăng ký thay đổi|đại diện pháp luật|ai là|ai đứng tên|hết hạn|thời hạn|hiệu lực|khi nào|bao giờ|ngày hết hạn|hạn hoạt động|thời gian hoạt động|giá trị đến|còn hạn|quá hạn|hết hiệu lực|bao nhiêu|mấy năm|hạn đến|nội dung trong|trích xuất thông tin|bài toán vốn|tổng số vốn/i;
 
-  // 3. Tiếng Anh (English: shareholder, shareholding, capital, address, representative, tax code, business registration, who, what, expire, expiry, validity...)
-  var enPattern = /shareholder|shareholding|share|equity|capital|address|representative|director|owner|tax code|business registration|registration|detail|details|info|information|who|what|how much|how many|percentage|ratio|expire|expiry|expiration|validity|valid|when|duration|period/i;
+  // 2. Tiếng Hàn: Các từ khóa hỏi thông tin cụ thể (주주 - cổ đông, 지분율 - tỷ lệ, 대표 - đại diện, 자본금 - vốn, 등록번호 - mã số...)
+  var koPattern = /주주|지분|지분율|대표|대표자|자본|자본금|주소|등록번호|법인|누구|어떻게|얼마|어디|원|퍼센트|%|만기|유효|기간|언제|만료/i;
+
+  // 3. Tiếng Anh: Các từ khóa hỏi thông tin cụ thể (tax code, capital, representative, shareholder, expire, validity...)
+  var enPattern = /shareholder|shareholding|share|equity|capital|address|representative|director|owner|tax code|business registration|who|what|how much|how many|percentage|ratio|expire|expiry|expiration|validity|valid|when|duration|period/i;
 
   return viPattern.test(lower) || koPattern.test(lower) || enPattern.test(lower);
 }
@@ -6009,7 +6688,7 @@ function extractFileContent(fileId) {
   try {
     var cached = CacheService.getScriptCache().get(cacheKey);
     if (cached) return cached;
-  } catch (ce) {}
+  } catch (ce) { }
 
   try {
     var file = DriveApp.getFileById(fileId);
@@ -6020,7 +6699,7 @@ function extractFileContent(fileId) {
       var doc = DocumentApp.openById(fileId);
       var text = doc.getBody().getText();
       if (text && text.length > 10) {
-        try { CacheService.getScriptCache().put(cacheKey, text.substring(0, 50000), 900); } catch (e) {}
+        try { CacheService.getScriptCache().put(cacheKey, text.substring(0, 50000), 900); } catch (e) { }
         return text;
       }
     }
@@ -6030,9 +6709,9 @@ function extractFileContent(fileId) {
       var ss = SpreadsheetApp.openById(fileId);
       var sheet = ss.getSheets()[0];
       var values = sheet.getDataRange().getValues();
-      var sheetText = values.map(function(r) { return r.join(" | "); }).join("\n");
+      var sheetText = values.map(function (r) { return r.join(" | "); }).join("\n");
       if (sheetText) {
-        try { CacheService.getScriptCache().put(cacheKey, sheetText.substring(0, 50000), 900); } catch (e) {}
+        try { CacheService.getScriptCache().put(cacheKey, sheetText.substring(0, 50000), 900); } catch (e) { }
         return sheetText;
       }
     }
@@ -6086,6 +6765,8 @@ function multiDocumentFileQnA(userQuestion, selectedFiles) {
 
   var prompt = "Bạn là chuyên gia phân tích tài chính và pháp lý doanh nghiệp cao cấp 200 AI (Tập đoàn ADD / VPA / AGB / ADC / ASG / TYM VINA / Worksmate).\n" +
     "Người dùng đang đặt câu hỏi tổng hợp / tính toán trên NHIỀU TÀI LIỆU DƯỚI ĐÂY: \"" + userQuestion + "\".\n\n" +
+    "QUY TẮC CỰC KỲ NGHIÊM NGẶT KHI NỘI DUNG TÀI LIỆU KHÔNG CHỨA THÔNG TIN ĐƯỢC HỎI:\n" +
+    "- Nếu TẤT CẢ các tài liệu đều KHÔNG chứa thông tin về cá nhân/đối tượng được hỏi, BẮT BUỘC trả về: 'KHONG_TIM_THAY_THONG_TIN: [lý do ngắn gọn].'. TUYỆT ĐỐI KHÔNG liệt kê thông tin của người khác có trong tài liệu khi người dùng không hỏi về họ!\n\n" +
     "NHIỆM VỤ SUY LUẬN LOGIC VÀ TÍNH TOÁN:\n" +
     "1. ĐỌC TẤT CẢ CÁC TÀI LIỆU ĐƯỢC CUNG CẤP: Tìm và trích xuất chính xác số vốn góp (VNĐ hoặc USD) và tỷ lệ phần trăm sở hữu (%) của từng cá nhân / tổ chức được hỏi (ví dụ: 'Son Min Chang') trong TỪNG TÀI LIỆU VÀ TỪNG CÔNG TY THÀNH VIÊN.\n" +
     "2. THỰC HIỆN TÍNH TOÁN TỔNG CỘNG (CALCULATION):\n" +
@@ -6095,7 +6776,9 @@ function multiDocumentFileQnA(userQuestion, selectedFiles) {
     "   - Dùng thẻ <b>...</b> để in đậm tiêu đề và số liệu quan trọng. TUYỆT ĐỐI KHÔNG DÙNG dấu **!\n" +
     "   - Dùng dấu • để gạch đầu dòng danh sách.\n" +
     "   - Trình bày rõ ràng: Chi tiết từng công ty/tài liệu ➔ Cuối cùng ghi rõ dòng <b>🔥 TỔNG CỘNG VỐN ĐÃ GÓP:</b> ... VNĐ (tương đương ... USD).\n" +
-    "4. TRÍCH XUẤT NGUYÊN BẢN CHÍNH XÁC 100%: Ghi rõ số liệu lấy từ từng file tài liệu nào để đảm bảo tính minh bạch.\n\n";
+    "4. TRÍCH XUẤT NGUYÊN BẢN CHÍNH XÁC 100%: Ghi rõ số liệu lấy từ từng file tài liệu nào để đảm bảo tính minh bạch.\n" +
+    "5. QUY TẮC CẤM BỊA ĐẶT THÔNG TIN: Nếu bạn không biết câu trả lời hoặc không tìm thấy dữ liệu trong các tài liệu được cung cấp, chỉ cần nói rằng bạn không biết, đừng cố bịa ra câu trả lời cho tôi.\n\n";
+
 
   var parts = [];
 
@@ -6118,7 +6801,7 @@ function multiDocumentFileQnA(userQuestion, selectedFiles) {
 
   var payload = { contents: [{ parts: parts }] };
 
-  var modelsToTry = ["gemini-2.5-flash", "gemini-2.5-flash-lite", "gemini-3.1-flash-lite", "gemini-3.5-flash-lite"];
+  var modelsToTry = ["gemini-3.1-flash", "gemini-3.5-flash-lite", "gemini-2.5-flash-lite", "gemini-2.5-flash"];
   var options = {
     method: "post",
     contentType: "application/json",
@@ -6178,8 +6861,12 @@ function answerQuestionWithFileContent(userQuestion, fileItem) {
   var prompt = "Bạn là trợ lý AI cao cấp 200 AI (phân tích dữ liệu doanh nghiệp tập đoàn ADD / VPA / AGB / ADC / ASG / TYM VINA / Worksmate).\n" +
     "Người dùng đang đặt câu hỏi: \"" + userQuestion + "\".\n" +
     "Nhiệm vụ của bạn là đọc toàn bộ NỘI DUNG TÀI LIỆU (" + fileName + ") dưới đây và thực hiện suy luận logic thông minh, chính xác 100% để trả lời đúng trọng tâm người dùng.\n\n" +
-    "QUY TẮC SUY LUẬN LOGIC VÀ TÍNH TOÁN:\n" +
-    "1. HIỂU CÂU HỎI PHỨC TẠP, HẾT HẠN & THỜI HẠN:\n" +
+    "QUY TẮC CỰC KỲ NGHIÊM NGẶT KHI NỘI DUNG TÀI LIỆU KHÔNG CHỨA THÔNG TIN ĐƯỢC HỎI:\n" +
+    "1. Nếu người dùng hỏi thông tin liên quan đến một cá nhân/dự án/đối tượng cụ thể (ví dụ: 'Lê Ngọc Quỳnh', 'nghỉ phép của X', 'hợp đồng của Y') mà NỘI DUNG TÀI LIỆU KHÔNG CHỨA thông tin về cá nhân/đối tượng đó:\n" +
+    "   - BẮT BUỘC chỉ trả về duy nhất cụm từ đặc biệt: 'KHONG_TIM_THAY_THONG_TIN: Tôi đã rà soát tài liệu \"" + fileName + "\" nhưng không tìm thấy thông tin liên quan đến đối tượng được hỏi trong tài liệu này.'\n" +
+    "   - TUYỆT ĐỐI CẤM KHÔNG ĐƯỢC tự ý liệt kê các danh sách thành viên, cổ đông, hoặc thông tin cá nhân của người khác (như Đặng Đình Thuyết, Son Min Chang...) có trong tài liệu khi người dùng KHÔNG HỎI về họ!\n" +
+    "   - TUYỆT ĐỐI KHÔNG ĐƯỢC trả lời thông tin lệch chủ đề hoặc tự bịa ra thông tin cho người dùng!\n" +
+    "2. HIỂU CÂU HỎI PHỨC TẠP, HẾT HẠN & THỜI HẠN:\n" +
     "   - Phân tích linh hoạt các câu hỏi về thời hạn, hết hạn, hiệu lực, ngày cấp, danh sách cổ đông, vốn điều lệ, địa chỉ trụ sở.\n" +
     "   - NẾU HỎI VỀ NGÀY HẾT HẠN / THỜI HẠN GIẤY PHÉP (IRC, Hợp đồng, Giấy phép lao động...):\n" +
     "     * Trích xuất chính xác Ngày cấp, Ngày đăng ký lần đầu/thay đổi và Thời hạn hoạt động của giấy phép/dự án (ví dụ: 10 năm, 20 năm, 50 năm).\n" +
@@ -6187,13 +6874,14 @@ function answerQuestionWithFileContent(userQuestion, fileItem) {
     "     * TÍNH TOÁN VÀ ĐÁNH GIÁ TRẠNG THÁI HIỆU LỰC (So sánh với thời điểm hiện tại năm 2026 ➔ Ghi rõ Còn hiệu lực bao nhiêu năm/tháng nữa hay đã hết hạn).\n" +
     "     * Nếu văn bản có giá trị vô thời hạn (như Đăng ký doanh nghiệp ERC): Báo rõ văn bản có giá trị vô thời hạn.\n" +
     "   - Nếu người dùng hỏi về 'thành viên góp vốn' hoặc 'cổ đông': BẮT BUỘC liệt kê ĐẦY ĐỦ từng cá nhân/tổ chức, Số tiền góp vốn (VNĐ/USD) và Tỷ lệ phần trăm (%) sở hữu tương ứng.\n" +
-    "2. NGÔN NGỮ PHẢN HỒI (STRICT LANGUAGE MATCHING):\n" +
+    "3. NGÔN NGỮ PHẢN HỒI (STRICT LANGUAGE MATCHING):\n" +
     "   - Tự động phát hiện ngôn ngữ câu hỏi: Tiếng Việt -> Trả lời Tiếng Việt; Tiếng Hàn (한국어) -> Trả lời 100% Tiếng Hàn; Tiếng Anh -> Trả lời Tiếng Anh.\n" +
-    "3. ĐỊNH DẠNG HTML GOOGLE CHAT CHUẨN ĐẸP:\n" +
+    "4. ĐỊNH DẠNG HTML GOOGLE CHAT CHUẨN ĐẸP:\n" +
     "   - Dùng thẻ <b>...</b> để in đậm tiêu đề và thông tin quan trọng (Ví dụ: <b>📅 NGÀY HẾT HẠN:</b> ..., <b>⏳ TRẠNG THÁI:</b> ...). TUYỆT ĐỐI KHÔNG DÙNG dấu **!\n" +
     "   - Dùng dấu • để gạch đầu dòng danh sách (KHÔNG DÙNG dấu * hoặc -).\n" +
-    "4. ĐỘ CHÍNH XÁC NGUYÊN BẢN:\n" +
-    "   - Trích xuất đúng 100% số liệu, ngày tháng, tên người từ tài liệu. Không tự ý bịa đặt hoặc đoán số liệu không có trong file.\n\n";
+    "5. ĐỘ CHÍNH XÁC NGUYÊN BẢN & QUY TẮC CẤM BỊA ĐẶT THÔNG TIN:\n" +
+    "   - Trích xuất đúng 100% số liệu, ngày tháng, tên người từ tài liệu.\n" +
+    "   - Nếu bạn không biết câu trả lời hoặc không tìm thấy dữ liệu trong tài liệu, chỉ cần nói rằng bạn không biết, đừng cố bịa ra câu trả lời cho tôi.\n\n";
 
   var payload;
   if (content && typeof content === "object" && content.isPdfBlob) {
@@ -6304,11 +6992,21 @@ function isAuthorizedForInfoExtraction(userEmail, userName) {
   var emailLower = (userEmail || "").toLowerCase().trim();
   var nameLower = (userName || "").toLowerCase().trim();
 
-  // Sếp lớn, Tô Vũ Luật & Tài khoản 800@add-group.net / ADD IT luôn có TOÀN QUYỀN TRUY CẬP
-  if (emailLower.indexOf("800@") !== -1 || emailLower === "800@add-group.net" ||
-      emailLower.indexOf("boss@") !== -1 || emailLower.indexOf("tvluat@") !== -1 ||
-      emailLower.indexOf("luat") !== -1 || nameLower.indexOf("luật") !== -1 ||
-      nameLower.indexOf("son") !== -1 || nameLower.indexOf("add it") !== -1 || nameLower.indexOf("800") !== -1) {
+  var ALLOWED_EMAILS = [
+    "boss@add-group.net", "800@add-group.net", "ntttrang@planadd.com",
+    "tmtam@add-group.net", "tvluat@add-group.net", "anhdd@add-group.net", "tientt@add-group.net"
+  ];
+  for (var w = 0; w < ALLOWED_EMAILS.length; w++) {
+    if (emailLower === ALLOWED_EMAILS[w]) return true;
+  }
+
+  // Sếp lớn, Tô Vũ Luật, Team 200 & Tài khoản 800@add-group.net / ADD IT luôn có TOÀN QUYỀN TRUY CẬP
+  if (emailLower.indexOf("800@") !== -1 || emailLower.indexOf("boss@") !== -1 ||
+    emailLower.indexOf("tvluat@") !== -1 || emailLower.indexOf("luat") !== -1 ||
+    nameLower.indexOf("luật") !== -1 || nameLower.indexOf("duy anh") !== -1 ||
+    nameLower.indexOf("thủy tiên") !== -1 || nameLower.indexOf("tiên") !== -1 ||
+    nameLower.indexOf("trang") !== -1 || nameLower.indexOf("tâm") !== -1 ||
+    nameLower.indexOf("son") !== -1 || nameLower.indexOf("add it") !== -1 || nameLower.indexOf("800") !== -1) {
     return true;
   }
 
@@ -6316,7 +7014,7 @@ function isAuthorizedForInfoExtraction(userEmail, userName) {
   try {
     var cached = CacheService.getScriptCache().get(cacheKey);
     if (cached !== null) return cached === "true";
-  } catch (ce) {}
+  } catch (ce) { }
 
   try {
     var sheet = SpreadsheetApp.openById(SPREADSHEET_ID).getSheetByName('StaffInformation');
@@ -6332,15 +7030,15 @@ function isAuthorizedForInfoExtraction(userEmail, userName) {
       var rowStaffId = String(data[r][0] || "").trim();
 
       var isMatch = (emailLower && rowEmail && emailLower === rowEmail) ||
-                    (nameLower && rowName && (nameLower.indexOf(rowName) !== -1 || rowName.indexOf(nameLower) !== -1)) ||
-                    (nameLower && rowNick && nameLower.indexOf(rowNick) !== -1);
+        (nameLower && rowName && (nameLower.indexOf(rowName) !== -1 || rowName.indexOf(nameLower) !== -1)) ||
+        (nameLower && rowNick && nameLower.indexOf(rowNick) !== -1);
 
       if (isMatch) {
         var isAllowed = (rowDiv === "000" || rowDiv === "200" || rowDiv === "000-200" ||
-                         rowStaffId.indexOf("000") !== -1 || rowStaffId.indexOf("200") !== -1 ||
-                         rowNick.indexOf("000") !== -1 || rowNick.indexOf("200") !== -1 ||
-                         rowEmail.indexOf("800@") !== -1 || rowEmail.indexOf("boss@") !== -1 || rowEmail.indexOf("tvluat@") !== -1);
-        try { CacheService.getScriptCache().put(cacheKey, isAllowed ? "true" : "false", 600); } catch (e) {}
+          rowStaffId.indexOf("000") !== -1 || rowStaffId.indexOf("200") !== -1 ||
+          rowNick.indexOf("000") !== -1 || rowNick.indexOf("200") !== -1 ||
+          rowEmail.indexOf("800@") !== -1 || rowEmail.indexOf("boss@") !== -1 || rowEmail.indexOf("tvluat@") !== -1);
+        try { CacheService.getScriptCache().put(cacheKey, isAllowed ? "true" : "false", 600); } catch (e) { }
         return isAllowed;
       }
     }
@@ -6394,7 +7092,7 @@ function handleLinkRequest(text, senderName, message) {
   // NẾU NGUỜI DÙNG HỎI TRÍCH XUẤT THÔNG TIN TRONG FILE (Mã số doanh nghiệp, Vốn điều lệ, Cổ đông...):
   if (isInfoExtractionRequest(text)) {
     // 🔒 PHÂN QUYỀN CHẶT CHẼ: CHỈ BAN GIÁM ĐỐC (000) VÀ PHÒNG HÀNH CHÍNH (200) ĐƯỢC HỎI
-    var userEmail = message?.user?.email || message?.sender?.email || "";
+    var userEmail = (message && message.user && message.user.email) ? message.user.email : ((message && message.sender && message.sender.email) ? message.sender.email : "");
     var isAuthorized = isAuthorizedForInfoExtraction(userEmail, senderName);
 
     if (!isAuthorized) {
@@ -6426,8 +7124,13 @@ function handleLinkRequest(text, senderName, message) {
       if (multiFiles.length > 1) {
         var calculatedAiAnswer = multiDocumentFileQnA(text, multiFiles);
         if (calculatedAiAnswer) {
+          // Bắt tín hiệu không tìm thấy từ multiDoc
+          if (calculatedAiAnswer.indexOf("KHONG_TIM_THAY_THONG_TIN") !== -1) {
+            var cleanMultiMsg = calculatedAiAnswer.replace("KHONG_TIM_THAY_THONG_TIN:", "").trim();
+            return { "text": "🔍 " + cleanMultiMsg };
+          }
           var multiDocItem = {
-            name: multiFiles.map(function(f) { return f.name; }).join(", "),
+            name: multiFiles.map(function (f) { return f.name; }).join(", "),
             url: multiFiles[0].url
           };
           return buildFileQnACard(senderName, searchQuery, multiDocItem, calculatedAiAnswer);
@@ -6446,7 +7149,19 @@ function handleLinkRequest(text, senderName, message) {
         // Dự phòng: Nếu nạp PDF dung lượng lớn làm Gemini trả về null, tự động chuyển câu hỏi cho AI trả lời từ tên file
         aiAnswer = answerQuestionWithFileContent(text, { id: bestFile.id, name: bestFile.name });
       }
+
       if (aiAnswer) {
+        // Nếu AI trả về tín hiệu KHONG_TIM_THAY_THONG_TIN hoặc xác nhận không có thông tin đối tượng trong tài liệu
+        if (aiAnswer.indexOf("KHONG_TIM_THAY_THONG_TIN") !== -1) {
+          var cleanMsg = aiAnswer.replace("KHONG_TIM_THAY_THONG_TIN:", "").trim();
+          return { "text": "🔍 " + cleanMsg };
+        }
+
+        var lowerAnswer = aiAnswer.toLowerCase();
+        if (lowerAnswer.indexOf("không tìm thấy") !== -1 && (lowerAnswer.indexOf("không có thông tin") !== -1 || lowerAnswer.indexOf("không có dữ liệu") !== -1)) {
+          return { "text": "🔍 Tôi đã kiểm tra các file tài liệu liên quan nhưng **không tìm thấy thông tin về câu hỏi của bạn**. Anh/chị vui lòng kiểm tra lại tên nhân sự / hồ sơ hoặc liên hệ Phòng 200 để được hỗ trợ!" };
+        }
+
         return buildFileQnACard(senderName, searchQuery, bestFile, aiAnswer);
       }
     }
@@ -6490,7 +7205,7 @@ function extractSearchKeywordByGemini(userMessage) {
     "CÁC CÔNG TY THÀNH VIÊN VÀ CHI NHÁNH: ADC, ADD, AGB, ASG, TYM VINA & CESS, VPA (bao gồm VPA HCM, VPA HN), Worksmate, ADD Group, Se ADD, KPA, GEO ADD, ADD CON.\n\n" +
     "QUY TẮC BẮT BUỘC TRẢ VỀ:\n" +
     "1. Nếu người dùng nêu rõ chi nhánh (HCM, Hà Nội, HN, Đà Nẵng...), hãy giữ nguyên tên chi nhánh (Ví dụ: 'VPA HCM', 'VPA HN').\n" +
-    "2. 'ERC', 'IRC', 'đăng ký kinh doanh', 'đầu tư', 'giấy phép kinh doanh' -> mã 211.2\n" +
+    "2. 'ERC', 'IRC', 'đăng ký kinh doanh', 'đầu tư', 'giấy phép kinh doanh', 'mã số thuế', 'msdn', 'mst', 'vốn', 'vốn điều lệ', 'người đại diện', 'đại diện pháp luật' -> mã 211.2\n" +
     "3. 'điều lệ', 'quy định', 'quy chế' -> mã 211.1\n" +
     "4. 'sổ đỏ', 'gpxd', 'pccc', 'giấy phép xây dựng' -> mã 211.7\n" +
     "5. 'nhãn hiệu', 'brand' -> mã 211.4\n" +
@@ -6511,6 +7226,7 @@ function extractSearchKeywordByGemini(userMessage) {
     "20. 'văn phòng', 'office' -> mã 270\n" +
     "21. 'con dấu', 'stamp', 'chữ ký' -> mã 280\n" +
     "Cấu trúc trả về: '[MÃ THƯ MỤC] [TÊN CÔNG TY VÀ CHI NHÁNH]' (Ví dụ: '211.2 VPA HCM', '211.2 AGB', '211.1 VPA', '213', '217', '230').\n" +
+    "Nếu không xác định được hoặc không biết câu trả lời, chỉ cần trả về 'KHONG_RO', đừng cố bịa ra kết quả cho tôi.\n" +
     "Chỉ trả về đúng chuỗi kết quả ngắn gọn, không thêm bất kỳ văn bản nào khác.";
 
   var result = sendtoGeminiForLink(prompt);
@@ -6521,8 +7237,8 @@ function extractSearchKeywordByGemini(userMessage) {
   // 2. ⭐ BỘ LỌC DỰ PHÒNG THÔNG MINH (Rule-based Fallback)
   var compName = extractCompanyName(lower);
 
-  // ERC / IRC / Đăng ký kinh doanh / Đầu tư / ĐKKD -> 211.2
-  if (lower.indexOf("erc") !== -1 || lower.indexOf("irc") !== -1 || lower.indexOf("đăng ký kinh doanh") !== -1 || lower.indexOf("dkkd") !== -1 || lower.indexOf("đkkd") !== -1 || lower.indexOf("đầu tư") !== -1 || lower.indexOf("211.2") !== -1) {
+  // ERC / IRC / Đăng ký kinh doanh / Đầu tư / ĐKKD / Mã số thuế / MST / MSDN / Vốn / Đại diện -> 211.2
+  if (lower.indexOf("erc") !== -1 || lower.indexOf("irc") !== -1 || lower.indexOf("đăng ký kinh doanh") !== -1 || lower.indexOf("dkkd") !== -1 || lower.indexOf("đkkd") !== -1 || lower.indexOf("đầu tư") !== -1 || lower.indexOf("211.2") !== -1 || lower.indexOf("mã số thuế") !== -1 || lower.indexOf("mst") !== -1 || lower.indexOf("msdn") !== -1 || lower.indexOf("vốn") !== -1 || lower.indexOf("đại diện") !== -1) {
     return compName ? ("211.2 " + compName) : "211.2";
   }
   // Điều lệ / Quy định / Quy chế -> 211.1
@@ -6615,7 +7331,7 @@ function extractSearchKeywordByGemini(userMessage) {
 
 function extractCompanyName(text) {
   var t = text.toLowerCase();
-  
+
   // 1. Kiểm tra Công ty kèm Chi nhánh (HCM, Hà Nội, HN...)
   if (t.indexOf("vpa hcm") !== -1 || t.indexOf("vpa-hcm") !== -1 || t.indexOf("vpa hồ chí minh") !== -1 || t.indexOf("vpa sai gon") !== -1 || t.indexOf("vpa sài gòn") !== -1) return "VPA HCM";
   if (t.indexOf("add hcm") !== -1 || t.indexOf("add-hcm") !== -1) return "ADD HCM";
@@ -6711,8 +7427,8 @@ function extractFileVersionScore(fileName) {
   var score = 0;
   var name = fileName.toLowerCase();
 
-  // 1. Trích xuất năm (ví dụ 2025 -> +2500 điểm, 2021 -> +2100 điểm)
-  var yearMatch = name.match(/20[1-3][0-9]/);
+  // 1. Trích xuất năm độc lập (ví dụ 2025 -> +2500 điểm, 2021 -> +2100 điểm, dùng \b để tránh khớp nhầm chuỗi ngày dính liền như 22052026)
+  var yearMatch = name.match(/\b20[1-3][0-9]\b/);
   if (yearMatch) {
     var year = parseInt(yearMatch[0], 10);
     score += (year - 2000) * 100;
@@ -6726,6 +7442,39 @@ function extractFileVersionScore(fileName) {
   }
 
   return score;
+}
+
+function calculateQueryCoverageScore(queryStr, fileNameStr) {
+  if (!queryStr || !fileNameStr) return 0;
+  var qClean = removeAccents(queryStr.toLowerCase()).replace(/[^a-z0-9]/g, " ").trim();
+  var fClean = removeAccents(fileNameStr.toLowerCase()).replace(/[^a-z0-9]/g, " ").trim();
+
+  var stopWords = ["cho", "toi", "thong", "tin", "cua", "ve", "tap", "tin", "file", "moi", "nhat", "ngay", "bay", "cac", "trong", "thang", "nam", "giup", "xem"];
+  var qTokens = qClean.split(/\s+/).filter(function (t) { return t.length >= 1 && stopWords.indexOf(t) === -1; });
+
+  if (qTokens.length === 0) return 0;
+
+  var uniqueTokens = [];
+  for (var u = 0; u < qTokens.length; u++) {
+    if (uniqueTokens.indexOf(qTokens[u]) === -1) uniqueTokens.push(qTokens[u]);
+  }
+
+  var matchCount = 0;
+  for (var i = 0; i < uniqueTokens.length; i++) {
+    if (fClean.indexOf(uniqueTokens[i]) !== -1) {
+      matchCount++;
+    }
+  }
+
+  var ratio = matchCount / uniqueTokens.length;
+  if (ratio === 1.0) {
+    return 10000; // 100% khớp tất cả từ khóa ➔ +10,000 điểm ưu tiên cao nhất tuyệt đối!
+  } else if (ratio >= 0.75) {
+    return 5000;
+  } else if (ratio >= 0.5) {
+    return 2000;
+  }
+  return matchCount * 200;
 }
 
 function searchInDrive(keyword, rawText) {
@@ -6803,12 +7552,63 @@ function searchInDrive(keyword, rawText) {
       getFilesFromFolderDeep(foundCompanyFolder, results, addedIds, 0, 5);
     }
 
+    // 1.5. QUÉT THÊM THƯ MỤC VÉ MÁY BÀY (291. Quan ly cong tac - Air Ticket)
+    try {
+      var flightSheetsMap = getFlightSheetsMap();
+      var cleanQueryNorm = removeAccents(combinedQuery.toLowerCase()).replace(/[^a-z0-9]/g, " ");
+      var queryTokens = cleanQueryNorm.split(/\s+/).filter(function (t) { return t.length >= 2 && ["cho", "toi", "thong", "tin", "cua", "ve", "tap", "tin", "file", "moi", "nhat"].indexOf(t) === -1; });
+
+      for (var yK in flightSheetsMap) {
+        var yObj = flightSheetsMap[yK];
+        if (yObj && yObj.monthlyFolders) {
+          for (var mK in yObj.monthlyFolders) {
+            var mFold = yObj.monthlyFolders[mK];
+            if (mFold && mFold.files) {
+              for (var mf = 0; mf < mFold.files.length; mf++) {
+                var flItem = mFold.files[mf];
+                if (!addedIds[flItem.id]) {
+                  var flNameNorm = removeAccents(flItem.name.toLowerCase()).replace(/[^a-z0-9]/g, " ");
+                  var flScore = 0;
+
+                  for (var qt = 0; qt < queryTokens.length; qt++) {
+                    if (flNameNorm.indexOf(queryTokens[qt]) !== -1) {
+                      flScore += 200;
+                    }
+                  }
+
+                  if (flScore > 0) {
+                    addedIds[flItem.id] = true;
+                    results.push({
+                      name: flItem.name,
+                      url: flItem.url,
+                      mimeType: getMimeTypeLabel("application/pdf"),
+                      id: flItem.id,
+                      isFolder: false,
+                      parentFolderName: mFold.name,
+                      lastUpdated: new Date(),
+                      relevanceScore: flScore + 600,
+                      isOld: false
+                    });
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    } catch (errFlightSearch) {
+      Logger.log("searchInDrive flight folder search error: " + errFlightSearch.message);
+    }
+
     // 2. DÙNG DriveApp.searchFiles TRỰC TIẾP KHỚP TỪ KHÓA:
     var searchTerms = [];
     if (targetCompany) {
       var compParts = targetCompany.split(" ");
       for (var cp = 0; cp < compParts.length; cp++) {
-        searchTerms.push(compParts[cp]);
+        var cpTerm = compParts[cp].trim();
+        if (cpTerm.length >= 2 && searchTerms.indexOf(cpTerm) === -1) {
+          searchTerms.push(cpTerm);
+        }
       }
     }
     if (/\berc\b/i.test(combinedQuery)) searchTerms.push("erc");
@@ -6852,7 +7652,7 @@ function searchInDrive(keyword, rawText) {
     var isSoDoQuery = /sổ đỏ|gpxd|pccc|đất|211\.7/i.test(combinedQuery);
 
     if (isErcOnlyQuery && !isIrcOnlyQuery) {
-      // Chỉ giữ lại file ERC / ĐKKD, LỌC BỎ HOÀN TOÀN IRC HOẶC ĐIỀU LỆ
+      // Chỉ giữ lại file ERC / ĐKKD, LỌC BỎ HOÀN TOÀN IRC HOÀC ĐIỀU LỆ
       results = results.filter(function (item) {
         if (item.isFolder) return true;
         var nameLower = item.name.toLowerCase();
@@ -6934,6 +7734,9 @@ function searchInDrive(keyword, rawText) {
       // CỘNG ĐIỂM PHIÊN BẢN VÀ NĂM MỚI NHẤT (2025 > 2021, 5th > 4th > 3rd)
       score += extractFileVersionScore(item.name);
 
+      // CỘNG ĐIỂM KHỚP CHÍNH XÁC TỪ KHÓA CÂU HỎI (100% MATCHING OVERLAP BONUS)
+      score += calculateQueryCoverageScore(combinedQuery, item.name);
+
       // Trừ điểm mạnh nếu là file rác (điều hòa, nghiệm thu, vpp...)
       if (/điều hòa|nghiệm thu|bảo dưỡng|sửa chữa|vpp|chấm công/i.test(itemNameLower) && !isErcOnlyQuery) {
         score -= 1000;
@@ -6982,9 +7785,9 @@ function getFilesFromFolderDeep(folderObj, results, addedIds, currentDepth, maxD
             isOld: isOldFolder
           });
         }
-      } catch (fe) {}
+      } catch (fe) { }
     }
-  } catch (eFiles) {}
+  } catch (eFiles) { }
 
   try {
     var innerFolders = folderObj.getFolders();
@@ -7010,9 +7813,9 @@ function getFilesFromFolderDeep(folderObj, results, addedIds, currentDepth, maxD
           });
         }
         getFilesFromFolderDeep(innerF, results, addedIds, currentDepth + 1, maxDepth);
-      } catch (se) {}
+      } catch (se) { }
     }
-  } catch (eSubs) {}
+  } catch (eSubs) { }
 }
 
 function checkTokensMatch(text, tokens) {
@@ -7196,26 +7999,13 @@ function buildResultCard(senderName, searchQuery, results, rawText) {
 }
 
 function buildNotFoundCard(senderName, searchQuery) {
-  var subFolders = getSubFolders();
   var widgets = [
     {
       textParagraph: {
-        text: "Hiện tại tôi không tìm thấy dữ liệu nào liên quan tới điều bạn hỏi.\n\nBạn có thể chọn mở trực tiếp các thư mục bên dưới:"
+        text: "Hiện tại tôi không tìm thấy dữ liệu nào liên quan tới điều bạn hỏi."
       }
     }
   ];
-
-  for (var i = 0; i < subFolders.length; i++) {
-    var sf = subFolders[i];
-    widgets.push({
-      buttonList: {
-        buttons: [{
-          text: "📁 " + sf.name,
-          onClick: { openLink: { url: sf.url } }
-        }]
-      }
-    });
-  }
 
   return {
     cardsV2: [{
@@ -7240,10 +8030,33 @@ function handleDriveSearch(query) {
 }
 
 // ============================================================================
-// ✈️ 291. FLIGHT TICKET LOGIC (Tra cứu Vé máy bay & Lịch bay từ Google Sheet)
+// ✈️ 291. FLIGHT TICKET LOGIC (Tra cứu Vé máy bay & Lịch bay theo từng năm từ Google Drive)
 // ============================================================================
 
-var FLIGHT_SPREADSHEET_ID = "1qwh8dcJJHXR7Qavr8NvEKzsoBnxbNewqVTZ9caaMCbY";
+var FLIGHT_SPREADSHEET_ID = "1dt8gAAzrzEgaDPtI41JRcH90r0GOiBHt8mLfLhuOrAM"; // Google Sheet Vé Máy Bay Sếp chính thức
+var FLIGHT_SPREADSHEET_URL = "https://docs.google.com/spreadsheets/d/" + FLIGHT_SPREADSHEET_ID + "/edit#gid=1224052084"; // Link dẫn trực tiếp vào tab Ticket list
+var FLIGHT_FOLDER_ID = "1E_ZRg9tRR6OPrmwrbbIaVWZzK8ASkmdK";
+var FLIGHT_FOLDER_ID_2026 = "11gBHbEvyhwacLDp9U_yvagokZpvAFA_B";
+var FLIGHT_FOLDER_URL_2026 = "https://drive.google.com/drive/folders/11gBHbEvyhwacLDp9U_yvagokZpvAFA_B";
+
+/**
+ * Trả về URL dẫn thẳng vào tab Ticket list trong Google Sheet
+ */
+function getFlightTicketSheetUrl() {
+  try {
+    var cached = CacheService.getScriptCache().get("FLIGHT_TICKET_TAB_URL");
+    if (cached) return cached;
+
+    var ss = SpreadsheetApp.openById(FLIGHT_SPREADSHEET_ID);
+    var sheet = ss.getSheetByName("Ticket list") || ss.getSheetByName("Ticket List") || ss.getSheetByName("ticket list");
+    if (sheet) {
+      var tabUrl = "https://docs.google.com/spreadsheets/d/" + FLIGHT_SPREADSHEET_ID + "/edit#gid=" + sheet.getSheetId();
+      try { CacheService.getScriptCache().put("FLIGHT_TICKET_TAB_URL", tabUrl, 3600); } catch (e) { }
+      return tabUrl;
+    }
+  } catch (e) { }
+  return FLIGHT_SPREADSHEET_URL;
+}
 
 var FLIGHT_TRIGGER_KEYWORDS = [
   "vé máy bay", "lịch bay", "ngày bay", "chuyến bay", "mã chuyến bay",
@@ -7260,16 +8073,31 @@ var FLIGHT_TRIGGER_KEYWORDS = [
 function isFlightTicketRequest(text) {
   if (!text) return false;
   var lower = text.toLowerCase().trim();
+
+  // 1. Kiểm tra từ khóa cơ bản
   for (var i = 0; i < FLIGHT_TRIGGER_KEYWORDS.length; i++) {
     if (lower.indexOf(FLIGHT_TRIGGER_KEYWORDS[i]) !== -1) return true;
   }
+
+  // 2. Tên sếp / hành khách (Mr. Son, Son Min Chang, Madam, Vợ sếp...) + hành động bay / đi / công tác / về / sang
+  if (/(?:mr\.?\s*son|son\s*min\s*chang|mr\.?\s*sơn|sơn|sếp|madam|vợ\s*sếp|boss)\s*.*(?:bay|vé|lịch|công\s*tác|đi|về|sang|tới|đến)/i.test(lower)) return true;
+  if (/(?:bay|vé|lịch|công\s*tác|đi|về|sang|tới|đến)\s*.*(?:mr\.?\s*son|son\s*min\s*chang|mr\.?\s*sơn|sơn|sếp|madam|vợ\s*sếp|boss)/i.test(lower)) return true;
+
+  // 3. Regex linh hoạt các từ khóa chuyến bay, lịch bay, ngày bay, bay về, bay đi, sang Hàn Quốc, từ Hàn Quốc...
+  if (/(?:vé|lịch|chuyến|ngày|thời\s*gian|giờ)\s*(?:máy\s*bay|bay)/i.test(lower)) return true;
+  if (/(?:bay|chuyến\s*bay)\s*(?:về|đi|sang|tới|đến|từ)\s*(?:hàn\s*quốc|seoul|korea|incheon|việt\s*nam|vn|hà\s*nội|hanoi|tphcm|sài\s*gòn|đà\s*nẵng|nhật|japan|tokyo)/i.test(lower)) return true;
+  if (/(?:bay\s*về|bay\s*sang|bay\s*đi|bay\s*từ|bay\s*đến|có\s*bay)/i.test(lower)) return true;
+
   return false;
 }
 
 function handleFlightTicketRequest(text, senderName, userEmail) {
-  // ── Kiểm tra quyền: chỉ team 200 (Division = "200" hoặc "000") mới được xem vé của Sếp ──
+  // ── Kiểm tra quyền: chỉ team 200 (Division = "200" hoặc "000" hoặc "300") và Sếp mới được xem vé của Sếp ──
   // ── Whitelist email luôn được truy cập, không cần phân quyền Division ──
-  var FLIGHT_WHITELIST_EMAILS = ["tvluat@add-group.net", "800@add-group.net"];
+  var FLIGHT_WHITELIST_EMAILS = [
+    "boss@add-group.net", "800@add-group.net", "ntttrang@planadd.com",
+    "tmtam@add-group.net", "tvluat@add-group.net", "anhdd@add-group.net", "tientt@add-group.net"
+  ];
   var isWhitelisted = false;
   var userEmailLower = (userEmail || "").toLowerCase().trim();
   for (var w = 0; w < FLIGHT_WHITELIST_EMAILS.length; w++) {
@@ -7279,8 +8107,13 @@ function handleFlightTicketRequest(text, senderName, userEmail) {
   var userDivision = getUserDivision(userEmail);
   var allowed200 = ["200", "000", "300"];
   var hasPerm = isWhitelisted;
-  for (var d = 0; d < allowed200.length; d++) {
-    if (userDivision === allowed200[d]) { hasPerm = true; break; }
+  if (!hasPerm) {
+    for (var d = 0; d < allowed200.length; d++) {
+      if (userDivision === allowed200[d]) {
+        hasPerm = true;
+        break;
+      }
+    }
   }
 
   if (!hasPerm) {
@@ -7297,7 +8130,7 @@ function handleFlightTicketRequest(text, senderName, userEmail) {
             widgets: [
               {
                 textParagraph: {
-                  text: "⚠️ <b>" + senderName + "</b>, bạn không có quyền tra cứu lịch bay & vé máy bay của Sếp.\n\nChức năng này <b>chỉ dành riêng cho team 200</b>.\nNếu bạn cho rằng đây là nhầm lẫn, vui lòng liên hệ quản trị viên."
+                  text: "⚠️ <b>" + senderName + "</b>, bạn không có quyền tra cứu lịch bay & vé máy bay của Sếp.\n\nChức năng này <b>chỉ dành riêng cho team 200 & Ban Lãnh Đạo</b>.\nNếu bạn cho rằng đây là nhầm lẫn, vui lòng liên hệ quản trị viên."
                 }
               }
             ]
@@ -7307,8 +8140,119 @@ function handleFlightTicketRequest(text, senderName, userEmail) {
     };
   }
 
-  var flights = searchFlightTickets(text);
-  return buildFlightTicketCard(senderName, text, flights);
+  var searchResult = searchFlightTickets(text);
+
+  // Nếu đây là câu hỏi dạng tự nhiên (hỏi ngày nào, mấy giờ, khi nào, có bay không, bay về...):
+  var isNaturalQuestion = /(?:ngày nào|lúc mấy giờ|mấy giờ|khi nào|bao giờ|bay không|đi không|đi hàn|đi korea|đi công tác|về nước|chuyến nào|mã gì|có bay|có đi|có chuyến|có về|ngày bao nhiêu|bay về|bay sang|bay đi|bay từ|về hàn|sang hàn|tới hàn|đến hàn|về việt|sang việt|không\?)/i.test(text);
+
+  if (isNaturalQuestion) {
+    var aiAnswer = answerFlightQuestionWithAI(text, senderName, searchResult);
+    if (aiAnswer) {
+      var widgets = [
+        {
+          textParagraph: {
+            text: aiAnswer
+          }
+        },
+        {
+          buttonList: {
+            buttons: [{
+              text: "📊 Xem chi tiết trên Sheet",
+              onClick: { openLink: { url: getFlightTicketSheetUrl() } },
+              color: { red: 0.1, green: 0.5, blue: 0.9, alpha: 1 }
+            }]
+          }
+        }
+      ];
+
+      return {
+        cardsV2: [{
+          cardId: "flightAIAnswerCard",
+          card: {
+            header: {
+              title: "✈️ Lịch Trình Chuyến Bay ",
+              subtitle: "Cho " + senderName,
+              imageType: "CIRCLE"
+            },
+            sections: [{ widgets: widgets }]
+          }
+        }]
+      };
+    }
+  }
+
+  return buildFlightTicketCard(senderName, text, searchResult);
+}
+
+function answerFlightQuestionWithAI(userQuery, senderName, searchResult) {
+  try {
+    var targetYears = (searchResult && searchResult.targetYears && searchResult.targetYears.length > 0) ? searchResult.targetYears : ["2026"];
+    var targetY = targetYears.join(", ");
+    var rawFlights = getFlightTicketData(targetYears);
+
+    // Lọc dữ liệu nghiêm ngặt: Chỉ lấy chuyến bay có năm trùng với targetYears (Loại bỏ triệt để file/dữ liệu năm 2025 khi tra cứu 2026)
+    var allFlights = [];
+    for (var i = 0; i < rawFlights.length; i++) {
+      var fl = rawFlights[i];
+      var dateStr = String(fl.ngayBay || "").trim();
+      var yearMatch = dateStr.match(/\b(20[2-3][0-9])\b/);
+      if (yearMatch && targetYears.indexOf("ALL") === -1) {
+        if (targetYears.indexOf(yearMatch[0]) === -1 && targetYears.indexOf(parseInt(yearMatch[0], 10)) === -1) {
+          continue; // Loại bỏ chuyến bay khác năm (VD: 2025)
+        }
+      }
+      allFlights.push(fl);
+    }
+
+    var prompt =
+      "Bạn là trợ lý AI cao cấp 200 AI chuyên phân tích tư duy & trả lời chính xác câu hỏi về Lịch trình chuyến bay của Sếp (Mr. Son, Madam...).\n" +
+      "Người dùng (" + senderName + ") đang đặt câu hỏi: \"" + userQuery + "\".\n\n" +
+      "DƯỚI ĐÂY LÀ TOÀN BỘ DỮ LIỆU LỊCH CHUYẾN BAY TRONG FILE GOOGLE SHEET (NĂM " + targetY + "):\n" +
+      JSON.stringify(allFlights, null, 2) + "\n\n" +
+      "QUY TẮC PHÂN TÍCH TƯ DUY & LẬP LUẬN (STRICT AI REASONING RULES):\n" +
+      "1. QUY ĐỔI MÃ SÂN BAY TỰ ĐỘNG:\n" +
+      "   - INC, ICN, SEL, PUS, BUSAN = Hàn Quốc (Incheon / Seoul / Busan).\n" +
+      "   - HAN = Hà Nội (Nội Bài); SGN = TP. Hồ Chí Minh (Tân Sơn Nhất); DAD = Đà Nẵng.\n" +
+      "2. BẮT BUỘC NÊU RÕ NĂM CỤ THỂ:\n" +
+      "   - Khi nhắc đến tháng hay ngày, BẮT BUỘC phải ghi kèm NĂM CỤ THỂ (ví dụ: 'tháng 7/" + targetY + "' hoặc 'ngày 26/07/" + targetY + "'). KHÔNG ĐƯỢC chỉ ghi 'Tháng 7' chung chung.\n" +
+      "3. PHÂN TÍCH VÀ TRẢ LỜI THÔNG MINH (STRICT MONTH & ROUTE LOGIC):\n" +
+      "   - KIỂM TRA CHÍNH XÁC THÁNG & HÀNH TRÌNH ĐƯỢC HỎI:\n" +
+      "     * Khi người dùng hỏi về một tháng cụ thể (VD: 'Tháng 5/2026') và địa điểm cụ thể (VD: 'đi Hàn Quốc'):\n" +
+      "       + BẮT BUỘC kiểm tra xem TRONG ĐÚNG THÁNG ĐÓ (Ví dụ: Tháng 5) có chuyến bay nào có điểm đi/đến là Hàn Quốc (INC/ICN/SEL/PUS) hay không.\n" +
+      "       + TUYỆT ĐỐI KHÔNG ĐƯỢC KẾT LUẬN 'Vào tháng 5/2026 Mr. Son CÓ đi Hàn Quốc' khi các chuyến bay đi Hàn Quốc diễn ra vào THÁNG 6 (01/06/2026)!\n" +
+      "       + Nếu trong tháng 5/2026 chỉ có các chuyến bay nội địa (Hà Nội <-> TP.HCM) và KHÔNG CÓ chuyến bay đi Hàn Quốc, BẮT BUỘC KẾT LUẬN RÕ:\n" +
+      "         'Vào <b>tháng 5/2026</b>, Mr. Son <b>KHÔNG CÓ</b> chuyến bay nào đi <b>Hàn Quốc</b> (Incheon). Trong tháng 5/2026, Mr. Son chỉ có các chuyến bay nội địa (như Hà Nội ↔ TP. Hồ Chí Minh)...'\n" +
+      "       + Sau đó mới bổ sung gợi ý lịch bay Hàn Quốc gần nhất tiếp theo: 'Chuyến bay đi Hàn Quốc gần nhất của Mr. Son là vào đầu <b>tháng 6/2026</b> (ngày <b>01/06/2026</b> chặng HAN ➔ INC mã VJ962, và ngày <b>15/06/2026</b> chặng INC ➔ HAN mã VJ961)...'\n" +
+      "   - NẾU TÌM THẤY CHUYẾN BAY ĐÚNG NGÀY/THÁNG & ĐÚNG HÀNH TRÌNH NGƯỜI DÙNG HỎI:\n" +
+      "     * Khẳng định rõ: 'Vào [Tháng/Năm], Mr. Son CÓ chuyến bay đi [Điểm đến]...'\n" +
+      "     * Trích xuất chính xác: Ngày bay, Giờ bay, Ngày hạ cánh, Giờ hạ cánh, Tên chuyến bay / Hành trình, Mã chuyến bay, Mã đặt vé (nếu có).\n" +
+      "   - NẾU KHÔNG CÓ CHUYẾN BAY VÀO NGÀY/THÁNG CỤ THỂ ĐÓ:\n" +
+      "     * Nêu rõ sự thật là không có chuyến bay đó vào ngày/tháng đó, sau đó liệt kê gợi ý các chuyến bay khác trong tháng/năm.\n" +
+      "4. IN ĐẬM BẮT BUỘC CHO THÔNG TIN QUAN TRỌNG:\n" +
+      "   - Dùng thẻ <b>...</b> để IN ĐẬM tất cả Ngày/Tháng/Năm, Tên sếp (<b>Mr. Son</b>), Địa điểm (<b>Hàn Quốc</b>, <b>Hà Nội</b>), Giờ cất cánh/hạ cánh, Mã chuyến bay...\n" +
+      "5. TUYỆT ĐỐI BỎ HOÀN TOÀN LINK DRIVER & URL:\n" +
+      "   - TUYỆT ĐỐI KHÔNG xuất bất kỳ đường dẫn URL link Drive (https://drive.google.com/...) hoặc các cụm '[Link xem chi tiết]' trong văn bản (hệ thống sẽ tự chèn nút bấm ở dưới).\n" +
+      "6. QUY TẮC CỰC KỲ NGHIÊM NGẶT - CẤM TỰ SỬA NĂM VÀ TỰ Ý GÁN HÀNH KHÁCH (STRICT DATA INTEGRITY):\n" +
+      "   - TUYỆT ĐỐI KHÔNG tự ý đổi năm 2025 thành 2026! Nếu dữ liệu ghi năm 2025 thì đó là chuyến bay năm 2025, KHÔNG ĐƯỢC biến nó thành năm 2026!\n" +
+      "   - TUYỆT ĐỐI KHÔNG tự ý gán chuyến bay của hành khách khác (như Cường, Ngọc...) cho Mr. Son! Kiểm tra chính xác mã/tên hành khách!\n" +
+      "   - CHỈ trích xuất đúng thông tin thực tế từ dữ liệu được cung cấp, tuyệt đối không tự sửa đổi dữ liệu!\n" +
+      "7. QUY TẮC CẤM BỊA ĐẶT THÔNG TIN: Nếu bạn không biết câu trả lời hoặc trong dữ liệu không có thông tin chuyến bay được hỏi, chỉ cần nói rằng bạn không biết, đừng cố bịa ra câu trả lời cho tôi.";
+
+    var responseText = sendtoGemini(prompt);
+    if (!responseText) return null;
+
+    // Loại bỏ toàn bộ URL Drive & Markdown link thừa
+    responseText = responseText.replace(/\[(?:Link|Xem|Link xem chi tiết|Xem chi tiết)[^\]]*\]\([^)]*\)/gi, "");
+    responseText = responseText.replace(/https?:\/\/[^\s\)]+/gi, "");
+
+    // Chuyển đổi Markdown bold (**text**) sang HTML bold (<b>text</b>) để Google Chat hiển thị in đậm đậm nét
+    responseText = responseText.replace(/\*\*([^*]+)\*\*/g, "<b>$1</b>");
+
+    return responseText;
+  } catch (e) {
+    Logger.log("answerFlightQuestionWithAI error: " + e.toString());
+  }
+  return null;
 }
 
 // Tra cứu Division (cột K, index 10) của user từ StaffInformation sheet theo email (cột L, index 11)
@@ -7333,35 +8277,264 @@ function getUserDivision(email) {
   return "";
 }
 
-function getFlightTicketData() {
+/**
+ * Tự động tìm kiếm & quét ánh xạ { [Year]: { id, url, monthlyFolders } } trong Folder 2026 (11gBHbEvyhwacLDp9U_yvagokZpvAFA_B)
+ * và Folder tổng 291 (1E_ZRg9tRR6OPrmwrbbIaVWZzK8ASkmdK).
+ * Sử dụng CacheService để tối ưu tốc độ (<10ms).
+ */
+function getFlightSheetsMap() {
+  var cacheKey = "FLIGHT_SHEETS_MAP_V7";
+  try {
+    var cached = CacheService.getScriptCache().get(cacheKey);
+    if (cached) return JSON.parse(cached);
+  } catch (ce) { }
+
+  var fFolderUrl = (typeof FLIGHT_FOLDER_URL_2026 !== "undefined" && FLIGHT_FOLDER_URL_2026) ? FLIGHT_FOLDER_URL_2026 : "https://docs.google.com/spreadsheets/d/" + FLIGHT_SPREADSHEET_ID + "/edit";
+
+  var map = {
+    "2026": { id: FLIGHT_SPREADSHEET_ID, url: "https://docs.google.com/spreadsheets/d/" + FLIGHT_SPREADSHEET_ID + "/edit", folderUrl: fFolderUrl, monthlyFolders: {} }
+  };
+
+  // 1. Quét trực tiếp Thư mục năm 2026 theo ID chính xác do người dùng chỉ định: 11gBHbEvyhwacLDp9U_yvagokZpvAFA_B
+  try {
+    var folder2026 = DriveApp.getFolderById(FLIGHT_FOLDER_ID_2026);
+    map["2026"].folderUrl = folder2026.getUrl();
+
+    var sheets2026 = folder2026.getFilesByType(MimeType.GOOGLE_SHEETS);
+    if (sheets2026 && sheets2026.hasNext()) {
+      var sheetFile = sheets2026.next();
+      map["2026"].id = sheetFile.getId();
+      map["2026"].url = sheetFile.getUrl();
+      map["2026"].name = sheetFile.getName();
+    }
+
+    var monthSubFolders = folder2026.getFolders();
+    while (monthSubFolders && monthSubFolders.hasNext()) {
+      var mFolder = monthSubFolders.next();
+      var mName = mFolder.getName().trim();
+      var mMatch = mName.match(/(?:tháng|thang|t)\s*(\d{1,2})/i);
+      if (mMatch) {
+        var monthNum = parseInt(mMatch[1], 10);
+        var mFiles = [];
+        try {
+          var filesInMonth = mFolder.getFiles();
+          while (filesInMonth && filesInMonth.hasNext()) {
+            var mFile = filesInMonth.next();
+            mFiles.push({
+              name: mFile.getName(),
+              url: mFile.getUrl(),
+              id: mFile.getId()
+            });
+          }
+        } catch (errMFiles) { }
+        map["2026"].monthlyFolders[String(monthNum)] = {
+          name: mName,
+          url: mFolder.getUrl(),
+          files: mFiles
+        };
+      }
+    }
+  } catch (err2026) {
+    Logger.log("Error scanning 2026 folder " + FLIGHT_FOLDER_ID_2026 + ": " + err2026.message);
+  }
+
+  try {
+    var parentFolder = DriveApp.getFolderById(FLIGHT_FOLDER_ID);
+
+    // 1. Quét các file Sheet trực tiếp ở thư mục gốc 291
+    var rootFiles = parentFolder.getFilesByType(MimeType.GOOGLE_SHEETS);
+    while (rootFiles && rootFiles.hasNext()) {
+      var file = rootFiles.next();
+      var fileName = file.getName();
+      var fId = file.getId();
+      var fUrl = file.getUrl();
+      map["manual"] = { id: fId, url: fUrl, name: fileName, monthlyFolders: {} };
+      var yMatch = fileName.match(/20[2-3][0-9]/);
+      if (yMatch) {
+        if (!map[yMatch[0]]) map[yMatch[0]] = { monthlyFolders: {} };
+        map[yMatch[0]].id = fId;
+        map[yMatch[0]].url = fUrl;
+        map[yMatch[0]].name = fileName;
+      }
+    }
+
+    // 2. Quét các Thư mục con năm (2023, 2024, 2025, 2026, Old...)
+    var subFolders = parentFolder.getFolders();
+    while (subFolders && subFolders.hasNext()) {
+      var folder = subFolders.next();
+      var folderName = folder.getName().trim();
+      var folderYearMatch = folderName.match(/20[2-3][0-9]/);
+
+      if (folderYearMatch) {
+        var yearKey = folderYearMatch[0];
+        if (yearKey === "2026") continue; // Đã quét trực tiếp thư mục 2026 chính chủ FLIGHT_FOLDER_ID_2026
+        if (!map[yearKey]) map[yearKey] = { monthlyFolders: {} };
+
+        // Lấy File Sheet chính của năm
+        var sheets = folder.getFilesByType(MimeType.GOOGLE_SHEETS);
+        if (sheets && sheets.hasNext()) {
+          var sheetFile = sheets.next();
+          map[yearKey].id = sheetFile.getId();
+          map[yearKey].url = sheetFile.getUrl();
+          map[yearKey].name = sheetFile.getName();
+        }
+        map[yearKey].folderUrl = folder.getUrl();
+
+        // 3. Quét thư mục con vé di chuyển từng tháng (VD: "Vé di chuyển tháng 6 - 2026", "Tháng 6")
+        try {
+          var monthSubFolders = folder.getFolders();
+          while (monthSubFolders && monthSubFolders.hasNext()) {
+            var mFolder = monthSubFolders.next();
+            var mName = mFolder.getName().trim();
+            var mMatch = mName.match(/(?:tháng|thang|t)\s*(\d{1,2})/i);
+            if (mMatch) {
+              var monthNum = parseInt(mMatch[1], 10);
+              var mFiles = [];
+              try {
+                var filesInMonth = mFolder.getFiles();
+                while (filesInMonth && filesInMonth.hasNext()) {
+                  var mFile = filesInMonth.next();
+                  mFiles.push({
+                    name: mFile.getName(),
+                    url: mFile.getUrl(),
+                    id: mFile.getId()
+                  });
+                }
+              } catch (errMFiles) { }
+              map[yearKey].monthlyFolders[String(monthNum)] = {
+                name: mName,
+                url: mFolder.getUrl(),
+                files: mFiles
+              };
+            }
+          }
+        } catch (errMFolders) { }
+      }
+    }
+
+    try {
+      CacheService.getScriptCache().put(cacheKey, JSON.stringify(map), 900); // Cache 15 phút
+    } catch (e) { }
+
+  } catch (err) {
+    Logger.log("getFlightSheetsMap error: " + err.toString());
+  }
+
+  return map;
+}
+
+/**
+ * Trích xuất danh sách năm từ câu hỏi của người dùng (Ví dụ: "năm 2024", "2025", "năm ngoái")
+ */
+function extractTargetYears(text) {
+  var years = [];
+  if (!text) return years;
+  var lower = text.toLowerCase();
+  var now = new Date();
+  var currentYear = now.getFullYear();
+
+  // "năm nay", "năm hiện tại"
+  if (/năm\s*(?:nay|hiện\s*tại)/i.test(lower)) {
+    years.push(currentYear);
+  }
+  // "năm ngoái", "năm trước"
+  if (/năm\s*(?:ngoái|trước)/i.test(lower)) {
+    years.push(currentYear - 1);
+  }
+  // "năm kia"
+  if (/năm\s*kia/i.test(lower)) {
+    years.push(currentYear - 2);
+  }
+  // "năm sau", "năm tới"
+  if (/năm\s*(?:sau|tới)/i.test(lower)) {
+    years.push(currentYear + 1);
+  }
+  // "các năm", "tất cả các năm", "tất cả năm", "lịch sử"
+  if (/(?:tất\s*cả|các|lịch\s*sử)\s*năm/i.test(lower)) {
+    years.push("ALL");
+  }
+
+  // Tìm các năm cụ thể 4 chữ số (ví dụ: 2023, 2024, 2025, 2026)
+  var regex = /\b(20[2-3][0-9])\b/g;
+  var match;
+  while ((match = regex.exec(lower)) !== null) {
+    var y = parseInt(match[1], 10);
+    if (years.indexOf(y) === -1) {
+      years.push(y);
+    }
+  }
+
+  return years;
+}
+
+/**
+ * Đọc dữ liệu chuyến bay theo danh sách các Năm được yêu cầu.
+ */
+function getFlightTicketData(targetYears) {
+  var flightList = [];
   try {
     var ss = SpreadsheetApp.openById(FLIGHT_SPREADSHEET_ID);
-    var sheet = ss.getSheets()[0];
-    // Sử dụng getDisplayValues() để lấy dữ liệu văn bản hiển thị thực tế trên Sheet (loại bỏ hoàn toàn lỗi Sat Dec 30 1899)
-    var data = sheet.getDataRange().getDisplayValues();
-    if (!data || data.length <= 1) return [];
+    var targetSheet = ss.getSheetByName("Ticket list") || ss.getSheetByName("Ticket List") || ss.getSheetByName("ticket list");
+    var sheetsToScan = targetSheet ? [targetSheet] : ss.getSheets();
+    var nowYear = String(new Date().getFullYear());
 
-    var flightList = [];
-    for (var r = 1; r < data.length; r++) {
-      var row = data[r];
-      if (!row[0] && !row[2] && !row[3] && !row[7]) continue;
+    for (var s = 0; s < sheetsToScan.length; s++) {
+      var sheet = sheetsToScan[s];
+      var shName = sheet.getName().trim();
 
-      flightList.push({
-        ngayBay: row[0] ? String(row[0]).trim() : "",
-        ngayHaCanh: row[1] ? String(row[1]).trim() : "",
-        diemDi: row[2] ? String(row[2]).trim() : "",
-        diemDen: row[3] ? String(row[3]).trim() : "",
-        thoiGianBay: row[4] ? String(row[4]).trim() : "",
-        thoiGianHaCanh: row[5] ? String(row[5]).trim() : "",
-        maHanhKhach: row[6] ? String(row[6]).trim() : "",
-        maChuyenBay: row[7] ? String(row[7]).trim() : ""
-      });
+      // Bỏ qua các sheet bản sao / nháp không cần thiết nếu quét toàn bộ
+      if (!targetSheet && /bản sao|copy|draft|old/i.test(shName)) continue;
+
+      var yMatch = shName.match(/\b(20[2-3][0-9])\b/);
+      var yStr = yMatch ? yMatch[0] : nowYear;
+
+      var data = sheet.getDataRange().getDisplayValues();
+      if (!data || data.length <= 1) continue;
+
+      for (var r = 1; r < data.length; r++) {
+        var row = data[r];
+        // Bỏ qua nếu các ô quan trọng trống
+        if (!row[0] && !row[4] && !row[5]) continue;
+        // Bỏ qua dòng tiêu đề nếu chứa tên cột
+        if (String(row[0]).trim().toLowerCase().indexOf("ngày bay") !== -1) continue;
+
+        var ngayBayStr = row[0] ? String(row[0]).trim() : "";
+        var yearFromRowMatch = ngayBayStr.match(/\b(20[2-3][0-9])\b/);
+        var flightYear = yearFromRowMatch ? yearFromRowMatch[1] : yStr;
+
+        // Lọc theo targetYears nếu có chỉ định
+        if (targetYears && targetYears.length > 0 && targetYears.indexOf("ALL") === -1) {
+          var yNum = parseInt(flightYear, 10);
+          if (targetYears.indexOf(flightYear) === -1 && targetYears.indexOf(yNum) === -1) {
+            continue;
+          }
+        }
+
+        var tenChuyen = row[4] ? String(row[4]).trim() : "";
+        var parts = tenChuyen.split("-");
+        var dDi = parts[0] ? parts[0].trim() : tenChuyen;
+        var dDen = parts[1] ? parts[1].trim() : tenChuyen;
+
+        flightList.push({
+          nam: flightYear,
+          ngayBay: ngayBayStr,
+          thoiGianBay: row[1] ? String(row[1]).trim() : "",
+          ngayHaCanh: row[2] ? String(row[2]).trim() : "",
+          thoiGianHaCanh: row[3] ? String(row[3]).trim() : "",
+          tenChuyenBay: tenChuyen,
+          diemDi: dDi,
+          diemDen: dDen,
+          maChuyenBay: row[5] ? String(row[5]).trim() : "",
+          maDatVe: row[6] ? String(row[6]).trim() : "",
+          sheetUrl: FLIGHT_SPREADSHEET_URL
+        });
+      }
     }
-    return flightList;
   } catch (e) {
     Logger.log("getFlightTicketData error: " + e.toString());
-    return [];
   }
+
+  return flightList;
 }
 
 function extractTargetMonths(text) {
@@ -7415,15 +8588,16 @@ function extractMonthFromDateStr(dateStr) {
 function checkLocationMatch(fl, lowerQuery) {
   var diemDiLower = fl.diemDi ? fl.diemDi.toLowerCase() : "";
   var diemDenLower = fl.diemDen ? fl.diemDen.toLowerCase() : "";
+  var tenChuyenLower = fl.tenChuyenBay ? fl.tenChuyenBay.toLowerCase() : "";
 
   // Danh sách địa điểm & bí danh mở rộng
   var aliases = [
-    { key: "việt nam", keywords: ["hanoi", "hà nội", "saigon", "sài gòn", "ho chi minh", "tphcm", "danang", "đà nẵng", "vn", "vietnam", "việt nam"] },
-    { key: "vietnam", keywords: ["hanoi", "hà nội", "saigon", "sài gòn", "ho chi minh", "tphcm", "danang", "đà nẵng", "vn", "vietnam", "việt nam"] },
-    { key: "vn", keywords: ["hanoi", "hà nội", "saigon", "sài gòn", "ho chi minh", "tphcm", "danang", "đà nẵng", "vn", "vietnam", "việt nam"] },
-    { key: "hàn quốc", keywords: ["seoul", "incheon", "busan", "hàn quốc", "korea", "sel", "icn"] },
-    { key: "korea", keywords: ["seoul", "incheon", "busan", "hàn quốc", "korea", "sel", "icn"] },
-    { key: "seoul", keywords: ["seoul", "sel", "incheon"] },
+    { key: "việt nam", keywords: ["hanoi", "hà nội", "saigon", "sài gòn", "ho chi minh", "tphcm", "danang", "đà nẵng", "vn", "vietnam", "việt nam", "han", "sgn", "dad"] },
+    { key: "vietnam", keywords: ["hanoi", "hà nội", "saigon", "sài gòn", "ho chi minh", "tphcm", "danang", "đà nẵng", "vn", "vietnam", "việt nam", "han", "sgn", "dad"] },
+    { key: "vn", keywords: ["hanoi", "hà nội", "saigon", "sài gòn", "ho chi minh", "tphcm", "danang", "đà nẵng", "vn", "vietnam", "việt nam", "han", "sgn", "dad"] },
+    { key: "hàn quốc", keywords: ["seoul", "incheon", "busan", "hàn quốc", "korea", "sel", "icn", "inc", "pus"] },
+    { key: "korea", keywords: ["seoul", "incheon", "busan", "hàn quốc", "korea", "sel", "icn", "inc", "pus"] },
+    { key: "seoul", keywords: ["seoul", "sel", "incheon", "icn", "inc"] },
     { key: "hà nội", keywords: ["hanoi", "hà nội", "han"] },
     { key: "hanoi", keywords: ["hanoi", "hà nội", "han"] },
     { key: "đà nẵng", keywords: ["danang", "đà nẵng", "dad"] },
@@ -7444,13 +8618,10 @@ function checkLocationMatch(fl, lowerQuery) {
   if (matchedKeywords.length === 0) return true; // Không hỏi địa điểm cụ thể
 
   // Kiểm tra hướng bay:
-  // "về [địa điểm]", "tới [địa điểm]", "đến [địa điểm]", "sang [địa điểm]" -> Lọc điểm ĐẾN (Destination)
-  // "từ [địa điểm]" -> Lọc điểm ĐI (Origin)
   var isHeadingTo = /(?:về|tới|đến|sang)\s+(?:hàn\s*quốc|korea|seoul|việt\s*nam|vietnam|vn|hà\s*nội|hanoi|đà\s*nẵng|sài\s*gòn|tphcm|nhật|japan|tokyo)/i.test(lowerQuery);
   var isHeadingFrom = /(?:từ)\s+(?:hàn\s*quốc|korea|seoul|việt\s*nam|vietnam|vn|hà\s*nội|hanoi|đà\s*nẵng|sài\s*gòn|tphcm|nhật|japan|tokyo)/i.test(lowerQuery);
 
   if (isHeadingTo && !isHeadingFrom) {
-    // Chỉ chấp nhận chuyến bay có ĐIỂM ĐẾN (diemDen) khớp với từ khóa
     for (var k = 0; k < matchedKeywords.length; k++) {
       if (diemDenLower.indexOf(matchedKeywords[k]) !== -1) return true;
     }
@@ -7458,16 +8629,15 @@ function checkLocationMatch(fl, lowerQuery) {
   }
 
   if (isHeadingFrom && !isHeadingTo) {
-    // Chỉ chấp nhận chuyến bay có ĐIỂM ĐI (diemDi) khớp với từ khóa
     for (var k2 = 0; k2 < matchedKeywords.length; k2++) {
       if (diemDiLower.indexOf(matchedKeywords[k2]) !== -1) return true;
     }
     return false;
   }
 
-  // Nếu câu hỏi không ghi hướng đi/đến rõ ràng -> khớp ở điểm ĐI hoặc điểm ĐẾN đều tính
   for (var k3 = 0; k3 < matchedKeywords.length; k3++) {
-    if (diemDiLower.indexOf(matchedKeywords[k3]) !== -1 || diemDenLower.indexOf(matchedKeywords[k3]) !== -1) {
+    var kw = matchedKeywords[k3];
+    if (diemDiLower.indexOf(kw) !== -1 || diemDenLower.indexOf(kw) !== -1 || tenChuyenLower.indexOf(kw) !== -1) {
       return true;
     }
   }
@@ -7477,6 +8647,7 @@ function checkLocationMatch(fl, lowerQuery) {
 function extractFlightIntentByGemini(userQuery) {
   try {
     var now = new Date();
+    var currentYear = now.getFullYear();
     var currentMonth = now.getMonth() + 1;
 
     var prompt =
@@ -7484,17 +8655,20 @@ function extractFlightIntentByGemini(userQuery) {
       "Nhiệm vụ: Phân tích câu hỏi của người dùng và trả về MỘT ĐỐI TƯỢNG JSON DUY NHẤT (không dùng markdown, không viết thêm chữ nào khác).\n\n" +
       "Cấu trúc JSON cần trả về:\n" +
       "{\n" +
+      "  \"targetYears\": [số năm 4 chữ số như 2023, 2024, 2025, 2026 hoặc \"ALL\"],\n" +
       "  \"targetMonths\": [số tháng 1-12],\n" +
       "  \"locationKeywords\": [\"từ khóa địa điểm như hanoi, seoul, vietnam, korea...\"],\n" +
       "  \"direction\": \"to\" | \"from\" | \"both\",\n" +
       "  \"flightCode\": \"mã chuyến bay nếu có, không có thì null\"\n" +
       "}\n\n" +
       "Quy tắc:\n" +
+      "- Năm hiện tại là " + currentYear + ". 'năm ngoái' -> [" + (currentYear - 1) + "]. 'năm nay' -> [" + currentYear + "]. 'năm 2024' -> [2024]. Không nói năm -> [].\n" +
       "- Tháng hiện tại là tháng " + currentMonth + ". 'tháng này' / 'tháng nay' / 'tháng hiện tại' -> [" + currentMonth + "]. 'tháng sau' -> [" + (currentMonth === 12 ? 1 : currentMonth + 1) + "]. 'tháng 7' -> [7]. Không nói tháng -> [].\n" +
       "- 'về Việt Nam' / 'tới Việt Nam' -> direction: 'to', locationKeywords: ['hanoi', 'hà nội', 'saigon', 'sài gòn', 'tphcm', 'ho chi minh', 'danang', 'đà nẵng', 'vietnam', 'việt nam', 'vn'].\n" +
       "- 'về Hàn Quốc' / 'tới Seoul' -> direction: 'to', locationKeywords: ['seoul', 'incheon', 'busan', 'hàn quốc', 'korea'].\n" +
       "- 'từ Hàn Quốc' -> direction: 'from', locationKeywords: ['seoul', 'incheon', 'busan', 'hàn quốc', 'korea'].\n" +
-      "- Không ghi hướng -> direction: 'both'. Không có địa điểm -> locationKeywords: [].\n\n" +
+      "- Không ghi hướng -> direction: 'both'. Không có địa điểm -> locationKeywords: [].\n" +
+      "- Nếu không biết câu trả lời hoặc không xác định được thông tin, trả về các mảng rỗng, đừng cố bịa ra dữ liệu cho tôi.\n\n" +
       "Câu hỏi: \"" + userQuery + "\"";
 
     var aiResponse = sendtoGemini(prompt);
@@ -7503,7 +8677,7 @@ function extractFlightIntentByGemini(userQuery) {
     var cleanJson = aiResponse.replace(/```json/gi, "").replace(/```/g, "").trim();
     var intent = JSON.parse(cleanJson);
 
-    if (intent && Array.isArray(intent.targetMonths)) {
+    if (intent && (Array.isArray(intent.targetMonths) || Array.isArray(intent.targetYears))) {
       return intent;
     }
   } catch (e) {
@@ -7513,15 +8687,17 @@ function extractFlightIntentByGemini(userQuery) {
 }
 
 function searchFlightTickets(userQuery) {
-  var allFlights = getFlightTicketData();
-  if (allFlights.length === 0) return [];
+  if (!userQuery) {
+    var defaultFlights = getFlightTicketData([]);
+    return { flights: defaultFlights, targetYears: [], targetMonths: [], sheetsMap: getFlightSheetsMap() };
+  }
 
-  if (!userQuery) return allFlights;
   var lower = userQuery.toLowerCase().trim();
 
   // 1. Thử dùng AI Gemini để hiểu ý định câu hỏi chính xác 100%
   var aiIntent = extractFlightIntentByGemini(userQuery);
 
+  var targetYears = [];
   var targetMonths = [];
   var flightCodeTerm = null;
   var hasLocation = false;
@@ -7530,6 +8706,7 @@ function searchFlightTickets(userQuery) {
 
   if (aiIntent) {
     Logger.log("[AI Flight Intent] " + JSON.stringify(aiIntent));
+    targetYears = aiIntent.targetYears || [];
     targetMonths = aiIntent.targetMonths || [];
     flightCodeTerm = aiIntent.flightCode ? String(aiIntent.flightCode).toLowerCase().replace(/\s+/g, "") : null;
     locationKeywords = aiIntent.locationKeywords || [];
@@ -7537,6 +8714,7 @@ function searchFlightTickets(userQuery) {
     direction = aiIntent.direction || "both";
   } else {
     // 2. Fallback sang Regex nếu AI chưa có phản hồi hoặc bị lỗi
+    targetYears = extractTargetYears(lower);
     targetMonths = extractTargetMonths(lower);
     var codeMatch = lower.match(/([a-z]{2}\s*\d{3,4})/i);
     if (codeMatch && codeMatch[1]) {
@@ -7548,9 +8726,12 @@ function searchFlightTickets(userQuery) {
     }
   }
 
-  // Nếu không có bộ lọc tháng, địa điểm hay mã chuyến bay -> trả về toàn bộ danh sách (câu hỏi chung)
-  if (targetMonths.length > 0 === false && flightCodeTerm === null && !hasLocation) {
-    return allFlights;
+  var sheetsMap = getFlightSheetsMap();
+  var allFlights = getFlightTicketData(targetYears);
+
+  // Nếu không có bộ lọc tháng, địa điểm hay mã chuyến bay -> trả về toàn bộ danh sách năm đó
+  if (targetMonths.length === 0 && flightCodeTerm === null && !hasLocation) {
+    return { flights: allFlights, targetYears: targetYears, targetMonths: targetMonths, sheetsMap: sheetsMap };
   }
 
   // 3. Lọc danh sách chuyến bay thỏa mãn ĐỒNG THỜI các điều kiện (AND filtering)
@@ -7601,80 +8782,64 @@ function searchFlightTickets(userQuery) {
     filtered.push(fl);
   }
 
-  return filtered;
+  return { flights: filtered, targetYears: targetYears, targetMonths: targetMonths, sheetsMap: sheetsMap };
 }
 
-function buildFlightTicketCard(senderName, searchQuery, flightList) {
-  var sheetUrl = "https://docs.google.com/spreadsheets/d/" + FLIGHT_SPREADSHEET_ID + "/edit";
+function buildFlightTicketCard(senderName, searchQuery, searchResult) {
+  var flightList = searchResult ? searchResult.flights : [];
+  var targetYears = searchResult ? searchResult.targetYears : [];
+  var targetMonths = searchResult ? searchResult.targetMonths : [];
   var widgets = [];
 
-  if (!flightList || flightList.length === 0) {
-    // Lấy danh sách tháng có sẵn trong sheet để gợi ý cho người dùng
-    var allData = getFlightTicketData();
-    var availableMonths = [];
-    for (var am = 0; am < allData.length; am++) {
-      var mth = extractMonthFromDateStr(allData[am].ngayBay);
-      if (mth !== null && availableMonths.indexOf(mth) === -1) availableMonths.push(mth);
-    }
-    availableMonths.sort(function (a, b) { return a - b; });
-    var monthHint = availableMonths.length > 0
-      ? "\n\n📌 <b>Các tháng hiện có lịch bay của Sếp:</b> Tháng " + availableMonths.join(", Tháng ")
-      : "";
+  var yearSubtitle = targetYears.length > 0 ? " (Năm " + targetYears.join(", ") + ")" : "";
 
+  if (!flightList || flightList.length === 0) {
     widgets.push({
       textParagraph: {
-        text: "🗓️ <b>Hiện nay, Boss không có chuyến bay nào" + (monthHint ? " phù hợp với yêu cầu của bạn." : " trong giai đoạn này.") + "</b>" + monthHint + "\n\nBạn có thể mở kiểm tra danh sách đầy đủ trên Google Sheet của Sếp:"
-      }
-    });
-    widgets.push({
-      buttonList: {
-        buttons: [{
-          text: "📊 Mở Sheet Vé Máy Bay Của Sếp",
-          onClick: { openLink: { url: sheetUrl } },
-          color: { red: 0.1, green: 0.5, blue: 0.9, alpha: 1 }
-        }]
+        text: "🗓️ <b>Hiện không tìm thấy dữ liệu chuyến bay nào trong hệ thống Google Sheet.</b>"
       }
     });
   } else {
-    for (var i = 0; i < flightList.length; i++) {
-      var fl = flightList[i];
-
-      var flightInfoHtml =
-        "✈️ <b>Mã chuyến bay: <font color='#1a73e8'>" + (fl.maChuyenBay || "N/A") + "</font></b>\n" +
-        "👤 <b>Mã hành khách (Sếp):</b> " + (fl.maHanhKhach || "N/A") + "\n" +
-        "📍 <b>Hành trình:</b> <b>" + (fl.diemDi || "N/A") + "</b> ➔ <b>" + (fl.diemDen || "N/A") + "</b>\n" +
-        "📅 <b>Ngày bay:</b> " + (fl.ngayBay || "N/A") + " <i>(Giờ xuất phát: " + (fl.thoiGianBay || "N/A") + ")</i>\n" +
-        "🛬 <b>Ngày hạ cánh:</b> " + (fl.ngayHaCanh || "N/A") + " <i>(Giờ hạ cánh: " + (fl.thoiGianHaCanh || "N/A") + ")</i>";
-
-      widgets.push({
-        textParagraph: {
-          text: flightInfoHtml
-        }
-      });
-
-      widgets.push({
-        buttonList: {
-          buttons: [{
-            text: "📊 Xem chi tiết trên Sheet của Sếp",
-            onClick: { openLink: { url: sheetUrl } },
-            color: { red: 0.1, green: 0.5, blue: 0.9, alpha: 1 }
-          }]
-        }
-      });
-
-      if (i < flightList.length - 1) {
-        widgets.push({ divider: {} });
+    widgets.push({
+      textParagraph: {
+        text: "✈️ <b>DANH SÁCH LỊCH CHUYẾN BAY (TỪ GOOGLE SHEET):</b>"
       }
+    });
+
+    var displayCount = Math.min(flightList.length, 10);
+    for (var i = 0; i < displayCount; i++) {
+      var fl = flightList[i];
+      var maDatVeStr = fl.maDatVe ? (" <i>(Mã đặt vé: <b>" + fl.maDatVe + "</b>)</i>") : "";
+      var flightInfoHtml =
+        "<b>" + (i + 1) + ". Mã chuyến bay: <font color='#1a73e8'>" + (fl.maChuyenBay || "N/A") + "</font></b>" + maDatVeStr + "\n" +
+        "  • <b>Tên chuyến bay:</b> <b>" + (fl.tenChuyenBay || (fl.diemDi + " - " + fl.diemDen)) + "</b>\n" +
+        "  • <b>Ngày bay:</b> " + (fl.ngayBay || "N/A") + " <i>(Giờ bay: " + (fl.thoiGianBay || "-") + ")</i>\n" +
+        "  • <b>Ngày & Giờ hạ cánh:</b> " + (fl.ngayHaCanh || fl.ngayBay || "N/A") + " <i>(Giờ hạ cánh: " + (fl.thoiGianHaCanh || "-") + ")</i>";
+
+      widgets.push({
+        textParagraph: { text: flightInfoHtml }
+      });
     }
   }
+
+  widgets.push({ divider: {} });
+  widgets.push({
+    buttonList: {
+      buttons: [{
+        text: "📊 Mở Sheet Vé Máy Bay Của Sếp",
+        onClick: { openLink: { url: getFlightTicketSheetUrl() } },
+        color: { red: 0.1, green: 0.5, blue: 0.9, alpha: 1 }
+      }]
+    }
+  });
 
   return {
     cardsV2: [{
       cardId: "flightTicketCard",
       card: {
         header: {
-          title: "✈️ Lịch Bay & Vé Máy Bay Của Sếp (291)",
-          subtitle: "Cho " + senderName + (flightList && flightList.length > 0 ? " • Tìm thấy " + flightList.length + " chuyến bay" : ""),
+          title: "✈️ Lịch Bay & Vé Máy Bay Của Sếp",
+          subtitle: "Cho " + senderName + yearSubtitle,
           imageType: "CIRCLE"
         },
         sections: [{ widgets: widgets }]
@@ -7846,26 +9011,14 @@ function getCleaningScheduleForWeek(weekKey, forceReset) {
         return JSON.parse(cached);
       }
     }
-  } catch (e) {}
+  } catch (e) { }
 
-  // 🔀 THUẬT TOÁN CHIA ĐỀU & RANDOM THÔNG MINH CHO 4 NGƯỜI PHÒNG 200 TRONG 5 NGÀY (THỨ 2 -> THỨ 6):
-  // 1. Tạo mảng 4 người phòng 200 và xáo trộn ngẫu nhiên (Fisher-Yates Shuffle) -> Đảm bảo cả 4 người đều có 1 ngày duy nhất
-  var shuffled4 = DEPT_200_MEMBERS.slice();
-  for (var i = shuffled4.length - 1; i > 0; i--) {
-    var j = Math.floor(Math.random() * (i + 1));
-    var temp = shuffled4[i];
-    shuffled4[i] = shuffled4[j];
-    shuffled4[j] = temp;
-  }
+  // 🔀 THUẬT TOÁN PHÂN CÔNG 4 NGƯỜI PHÒNG 200 TRONG 5 NGÀY (4 NGƯỜI 4 NGÀY + 1 NGÀY BỎ TRỐNG):
+  // 1. Tạo mảng 5 vị trí: 4 người phòng 200 + 1 vị trí null (bỏ trống)
+  var fiveDaysAssignments = DEPT_200_MEMBERS.slice();
+  fiveDaysAssignments.push(null); // Ngày thứ 5 bỏ trống không phân công
 
-  // 2. Chọn ngẫu nhiên 1 người thứ 5 từ 4 người (Tỷ lệ chia đều 25% cho ngày thứ 5 còn lại)
-  var extraRandomIndex = Math.floor(Math.random() * 4);
-  var extraPerson = DEPT_200_MEMBERS[extraRandomIndex];
-
-  // 3. Gom đủ 5 ngày (4 ngày chia đủ cho 4 người + 1 ngày random 25%)
-  var fiveDaysAssignments = shuffled4.concat([extraPerson]);
-
-  // 4. Xáo trộn thứ tự 5 ngày trong tuần (Thứ 2 đến Thứ 6 -> Đảm bảo Thứ 2 có thể là Tiên, Đạt, Duy Anh hay Luật hoàn toàn ngẫu nhiên)
+  // 2. Xáo trộn ngẫu nhiên 5 vị trí trong tuần (Fisher-Yates Shuffle)
   for (var k = fiveDaysAssignments.length - 1; k > 0; k--) {
     var m = Math.floor(Math.random() * (k + 1));
     var tmp = fiveDaysAssignments[k];
@@ -7885,7 +9038,7 @@ function getCleaningScheduleForWeek(weekKey, forceReset) {
 
   try {
     PropertiesService.getScriptProperties().setProperty(weekKey, JSON.stringify(schedule));
-  } catch (pe) {}
+  } catch (pe) { }
 
   return schedule;
 }
@@ -7899,7 +9052,11 @@ function handleCleaningScheduleQuery(senderName, isForceReset) {
   if (dayOfWeek >= 1 && dayOfWeek <= 5) {
     var todayAssignment = schedule[dayOfWeek - 1];
     if (todayAssignment) {
-      todayPersonName = todayAssignment.person.name + " (" + todayAssignment.person.email + ")";
+      if (todayAssignment.person) {
+        todayPersonName = todayAssignment.person.name + " (" + todayAssignment.person.email + ")";
+      } else {
+        todayPersonName = "Bỏ trống (Không phân công)";
+      }
     }
   }
 
@@ -7907,15 +9064,17 @@ function handleCleaningScheduleQuery(senderName, isForceReset) {
   var msg = "🧹 *BẢNG PHÂN CÔNG GIÁM SÁT VỆ SINH CÔNG TY TUẦN NÀY (Task 275)*" + resetNotice + "\n" +
     "_Dành cho Phòng 200 (Hành chính Nhân sự) - Cho " + senderName + "_\n\n" +
     "📢 *NGƯỜI TRỰC BAN HÔM NAY:* *" + todayPersonName + "*\n\n" +
-    "📋 *LỊCH TRỰC CHIA ĐỀU THỨ 2 -> THỨ 6 (4 NGƯỜI CHIA 4 NGÀY + 1 NGÀY RANDOM 25%):*\n";
+    "📋 *LỊCH TRỰC CHIA 4 NGƯỜI (4 NGÀY + 1 NGÀY BỎ TRỐNG):*\n";
 
   for (var s = 0; s < schedule.length; s++) {
     var item = schedule[s];
     var isTodayMark = (dayOfWeek === item.dayIndex) ? " 👈 *[HÔM NAY]*" : "";
-    msg += "• *" + item.dayName + ":* " + item.person.name + " (" + item.person.nick + ")" + isTodayMark + "\n";
+    var personDisplay = item.person ? (item.person.name + " (" + item.person.nick + ")") : "_Bỏ trống_";
+    msg += "• *" + item.dayName + ":* " + personDisplay + isTodayMark + "\n";
   }
 
-  msg += "\n📌 _Yêu cầu: Người trực ban kiểm tra vệ sinh văn phòng & cập nhật tiến độ Task 275 mỗi ngày._";
+  msg += "\n📌 _Yêu cầu: Người trực ban kiểm tra vệ sinh văn phòng & cập nhật tiến độ Task 275 mỗi ngày._\n" +
+    "🔗 *Link Sheet cập nhật Task 275:* https://docs.google.com/spreadsheets/d/1Mb9EEfxouUS0hFxL5wM4Cur7weJW6804chDN8WetAQ0/edit?gid=1404191066#gid=1404191066";
 
   return { text: msg };
 }
@@ -7932,7 +9091,10 @@ function sendDailyCleaningReminderTrigger() {
 
   var schedule = getCleaningScheduleForWeek();
   var todayAssignment = schedule[dayOfWeek - 1];
-  if (!todayAssignment) return;
+  if (!todayAssignment || !todayAssignment.person) {
+    Logger.log("Hôm nay là ngày bỏ trống, không có phân công trực vệ sinh.");
+    return;
+  }
 
   var assignedPerson = todayAssignment.person;
   var dateStr = Utilities.formatDate(today, "GMT+7", "dd/MM/yyyy");
@@ -7943,14 +9105,8 @@ function sendDailyCleaningReminderTrigger() {
     "👤 *NGƯỜI TRỰC BAN VỆ SINH:* *" + assignedPerson.name + "* (" + assignedPerson.email + ")\n\n" +
     "📌 *Nhiệm vụ kiểm tra vệ sinh (Task 275):*\n" +
     "• Đi kiểm tra tổng thể vệ sinh công ty (sàn nhà, bàn làm việc, khu vực chung, phòng họp).\n" +
-    "• Cập nhật tiến độ vào hạng mục: _275. Clean office and administrative work_.\n\n" +
-    "📋 *Lịch trực ban tuần này của Phòng 200:*\n";
-
-  for (var s = 0; s < schedule.length; s++) {
-    var item = schedule[s];
-    var isTodayMark = (dayOfWeek === item.dayIndex) ? " 👈 *[HÔM NAY]*" : "";
-    messageText += "• " + item.dayName + ": " + item.person.name + isTodayMark + "\n";
-  }
+    "• Cập nhật tiến độ vào hạng mục: _275. Clean office and administrative work_.\n" +
+    "🔗 *Link Sheet cập nhật Task 275:* https://docs.google.com/spreadsheets/d/1Mb9EEfxouUS0hFxL5wM4Cur7weJW6804chDN8WetAQ0/edit?gid=1404191066#gid=1404191066";
 
   Logger.log("Gửi nhắc nhở vệ sinh hôm nay cho: " + assignedPerson.name + "\nNội dung: " + messageText);
 
@@ -7974,7 +9130,7 @@ function sendDailyCleaningReminderTrigger() {
   // 2. Dự phòng: Gửi qua Webhook URL nếu được cấu hình
   if (!sentViaApi) {
     var webhookUrl = PropertiesService.getScriptProperties().getProperty("CLEANING_WEBHOOK_URL") ||
-                     PropertiesService.getScriptProperties().getProperty("NOTIFICATION_200_WEBHOOK_URL");
+      PropertiesService.getScriptProperties().getProperty("NOTIFICATION_200_WEBHOOK_URL");
 
     if (webhookUrl) {
       try {
@@ -8026,11 +9182,18 @@ function testSendDailyCleaningReminder() {
   var today = new Date();
   var dayOfWeek = today.getDay(); // 0: Sunday, 1: Mon, ..., 5: Fri, 6: Sat
 
-  // Nếu rơi vào cuối tuần thì mặc định lấy ngày Thứ 2 (index 0) để chạy thử nghiệm
+  // Nếu rơi vào cuối tuần hoặc ngày bỏ trống thì chọn ngày đầu tiên có người trực để thử nghiệm
   var todayIndex = (dayOfWeek >= 1 && dayOfWeek <= 5) ? (dayOfWeek - 1) : 0;
-  var todayAssignment = schedule[todayIndex];
-
-  var assignedPerson = todayAssignment.person;
+  if (!schedule[todayIndex] || !schedule[todayIndex].person) {
+    for (var i = 0; i < schedule.length; i++) {
+      if (schedule[i].person) {
+        todayIndex = i;
+        break;
+      }
+    }
+  }
+  var todayAssignment = (schedule && schedule[todayIndex]) ? schedule[todayIndex] : { dayName: "Thứ Hai", person: { name: "Thành viên 200", email: "200@add-group.net" } };
+  var assignedPerson = (todayAssignment && todayAssignment.person) ? todayAssignment.person : { name: "Thành viên 200", email: "200@add-group.net" };
   var dateStr = Utilities.formatDate(today, "GMT+7", "dd/MM/yyyy");
 
   var messageText = "🧪 *[THỬ NGHIỆM TỰ ĐỘNG] GIÁM SÁT VỆ SINH CÔNG TY (Task 275)*\n" +
@@ -8039,14 +9202,8 @@ function testSendDailyCleaningReminder() {
     "👤 *NGƯỜI TRỰC BAN VỆ SINH:* *" + assignedPerson.name + "* (" + assignedPerson.email + ")\n\n" +
     "📌 *Nhiệm vụ kiểm tra vệ sinh (Task 275):*\n" +
     "• Đi kiểm tra tổng thể vệ sinh công ty (sàn nhà, bàn làm việc, khu vực chung, phòng họp).\n" +
-    "• Cập nhật tiến độ vào hạng mục: _275. Clean office and administrative work_.\n\n" +
-    "📋 *Lịch trực ban tuần này của Phòng 200:*\n";
-
-  for (var s = 0; s < schedule.length; s++) {
-    var item = schedule[s];
-    var isTodayMark = (todayIndex === s) ? " 👈 *[HÔM NAY]*" : "";
-    messageText += "• " + item.dayName + ": " + item.person.name + isTodayMark + "\n";
-  }
+    "• Cập nhật tiến độ vào hạng mục: _275. Clean office and administrative work_.\n" +
+    "🔗 *Link Sheet cập nhật Task 275:* https://docs.google.com/spreadsheets/d/1Mb9EEfxouUS0hFxL5wM4Cur7weJW6804chDN8WetAQ0/edit?gid=1404191066#gid=1404191066";
 
   Logger.log("[TEST] Nội dung tin nhắn chuẩn bị gửi:\n" + messageText);
 
@@ -8067,7 +9224,7 @@ function testSendDailyCleaningReminder() {
   }
 
   var webhookUrl = PropertiesService.getScriptProperties().getProperty("CLEANING_WEBHOOK_URL") ||
-                   PropertiesService.getScriptProperties().getProperty("NOTIFICATION_200_WEBHOOK_URL");
+    PropertiesService.getScriptProperties().getProperty("NOTIFICATION_200_WEBHOOK_URL");
 
   if (webhookUrl) {
     try {

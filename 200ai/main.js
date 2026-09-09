@@ -2152,6 +2152,88 @@ function getCompanyRules() {
  * Trích xuất danh sách tài liệu, link và nội dung từ Thư mục 210. Documents Management
  * Bao gồm: 211 (Company Legal Documents), 212 (Reporting contract), 213 (Passport/Visa), 214→219...
  */
+/**
+ * 💾 LƯU BỘ NHỚ ĐỆM DỮ LIỆU DUNG LƯỢNG LỚN (LƯU VÀO GOOGLE SHEET & CHUNKING PROPERTIES)
+ * Chống lỗi 50,000 ký tự / cell của Google Sheet & lỗi 9KB của PropertiesService.
+ */
+function saveLegalDocsCache(text) {
+  if (!text) return;
+
+  // 1. Lưu vào Google Sheet dưới dạng các HÀNG (Rows) trong Cột A (Tránh vượt quá 50,000 ký tự / cell)
+  try {
+    var ssId = typeof INGESTION_LOG_SPREADSHEET_ID !== 'undefined' ? INGESTION_LOG_SPREADSHEET_ID : '10Bb29mvsPseVmNySShF93hejqCxpJRon0YC2-NyMBnQ';
+    var ss = SpreadsheetApp.openById(ssId);
+    var sheet = ss.getSheetByName("Legal_Docs_Cache");
+    if (!sheet) {
+      sheet = ss.insertSheet("Legal_Docs_Cache");
+    }
+    sheet.clearContents();
+
+    var lines = text.split('\n');
+    var rows = lines.map(function (line) {
+      var strLine = String(line || '');
+      return [strLine.length > 40000 ? strLine.substring(0, 40000) : strLine];
+    });
+
+    if (rows.length > 0) {
+      sheet.getRange(1, 1, rows.length, 1).setValues(rows);
+    }
+  } catch (se) {
+    Logger.log("saveLegalDocsCache Sheet error: " + se.message);
+  }
+
+  // 2. Phân mảnh Chunking vào PropertiesService (Mỗi mảnh 8,000 ký tự)
+  try {
+    var props = PropertiesService.getScriptProperties();
+    var CHUNK_SIZE = 8000;
+    var totalChunks = Math.ceil(text.length / CHUNK_SIZE);
+    props.setProperty("LEGAL_DOCS_CHUNK_COUNT", totalChunks.toString());
+    for (var c = 0; c < Math.min(totalChunks, 40); c++) {
+      var chunk = text.substring(c * CHUNK_SIZE, (c + 1) * CHUNK_SIZE);
+      props.setProperty("LEGAL_DOCS_CHUNK_" + c, chunk);
+    }
+  } catch (pe) {
+    Logger.log("saveLegalDocsCache Properties error: " + pe.message);
+  }
+}
+
+/**
+ * 📖 ĐỌC BỘ NHỚ ĐỆM DỮ LIỆU DUNG LƯỢNG LỚN
+ */
+function loadLegalDocsCache() {
+  // 1. Đọc từ PropertiesService (Chunking)
+  try {
+    var props = PropertiesService.getScriptProperties();
+    var countStr = props.getProperty("LEGAL_DOCS_CHUNK_COUNT");
+    if (countStr) {
+      var count = parseInt(countStr);
+      var result = "";
+      for (var i = 0; i < count; i++) {
+        var chunk = props.getProperty("LEGAL_DOCS_CHUNK_" + i);
+        if (chunk) result += chunk;
+      }
+      if (result && result.trim() !== "") return result;
+    }
+  } catch (pe) { }
+
+  // 2. Dự phòng: Đọc từ tab Sheet "Legal_Docs_Cache" (Các hàng Cột A)
+  try {
+    var ssId = typeof INGESTION_LOG_SPREADSHEET_ID !== 'undefined' ? INGESTION_LOG_SPREADSHEET_ID : '10Bb29mvsPseVmNySShF93hejqCxpJRon0YC2-NyMBnQ';
+    var ss = SpreadsheetApp.openById(ssId);
+    var sheet = ss.getSheetByName("Legal_Docs_Cache");
+    if (sheet) {
+      var values = sheet.getDataRange().getValues();
+      if (values && values.length > 0) {
+        var lines = values.map(function (r) { return r[0]; });
+        var text = lines.join('\n');
+        if (text && text.trim() !== "") return text;
+      }
+    }
+  } catch (se) { }
+
+  return null;
+}
+
 function getFolder211LegalDocsData() {
   try {
     var cacheKey = "LEGAL_DOCS_211_CACHE_V2";
@@ -2160,6 +2242,14 @@ function getFolder211LegalDocsData() {
       if (cached) return cached;
     } catch (ce) { }
 
+    // 1. Ưu tiên lấy từ bộ lưu trữ vĩnh viễn (được quét tự động ngầm qua Trigger)
+    var permCached = loadLegalDocsCache();
+    if (permCached && permCached.trim() !== "") {
+      try { CacheService.getScriptCache().put(cacheKey, permCached.substring(0, 90000), 21600); } catch (e) { }
+      return permCached;
+    }
+
+    // 2. Nếu chưa có dữ liệu quét ngầm, tiến hành quét nhanh trực tiếp trong giới hạn an toàn (<2.5s)
     var folderId = '0B_q5HyYkeLftU1NNSzhDWnRYVzA'; // Folder 210. Documents Management
     var parentFolder = null;
     try {
@@ -2174,13 +2264,17 @@ function getFolder211LegalDocsData() {
     var lines = [];
     lines.push("------------------- Danh sách Văn bản / Tài liệu Thư mục 210 (Documents Management: 211→219) -------------------");
 
+    var startTime = new Date().getTime();
+    var fileCount = 0;
+
     function scanFolder(folder, pathPrefix) {
       if (!folder) return;
+      if (new Date().getTime() - startTime > 2500 || fileCount >= 40) return; // Chặn timeout 2.5s khi chạy trực tiếp
 
-      // 1. Quét File trong folder hiện tại
       try {
         var files = folder.getFiles();
         while (files && files.hasNext()) {
+          if (new Date().getTime() - startTime > 2500 || fileCount >= 40) break;
           try {
             var file = files.next();
             if (!file) continue;
@@ -2200,9 +2294,10 @@ function getFolder211LegalDocsData() {
             lines.push("- Tài liệu: \"" + fName + "\" | Vị trí công ty/bộ phận: " + fullPath);
             lines.push("  Link xem: " + fUrl);
             if (textContent) {
-              var snippet = textContent.replace(/\s+/g, ' ').substring(0, 2000);
+              var snippet = textContent.replace(/\s+/g, ' ').substring(0, 1000);
               lines.push("  Trích yếu nội dung: " + snippet);
             }
+            fileCount++;
           } catch (fileErr) {
             Logger.log("Error processing individual file in " + pathPrefix + ": " + fileErr.message);
           }
@@ -2211,10 +2306,10 @@ function getFolder211LegalDocsData() {
         Logger.log("Error getting files in " + pathPrefix + ": " + filesErr.message);
       }
 
-      // 2. Quét SubFolders
       try {
         var subFolders = folder.getFolders();
         while (subFolders) {
+          if (new Date().getTime() - startTime > 2500 || fileCount >= 40) break;
           try {
             if (!subFolders.hasNext()) break;
             var sub = subFolders.next();
@@ -2234,16 +2329,95 @@ function getFolder211LegalDocsData() {
     scanFolder(parentFolder, "210. Documents Management");
 
     var resultText = lines.join('\n');
-
-    try {
-      CacheService.getScriptCache().put(cacheKey, resultText, 600); // Cache 10 phút
-    } catch (ce) { }
+    saveLegalDocsCache(resultText);
 
     return resultText;
   } catch (error) {
     Logger.log("Error in getFolder211LegalDocsData: " + error.toString());
     return "Không thể truy cập Thư mục 211 (1oDhTJUEmdICreryjojxuMisUVXT09jPD) hoặc thiếu quyền Drive.\n";
   }
+}
+
+/**
+ * 🔄 HÀM QUÉT NGẦM KHÔNG GIỚI HẠN THỜI GIAN (BẰNG TRIGGER TỰ ĐỘNG)
+ * Chạy ngầm trên máy chủ Google Apps Script (tối đa 6 phút), không bị giới hạn 30s của Google Chat!
+ */
+function refreshLegalDocsCacheTrigger() {
+  Logger.log("[Background Trigger] 🔄 Bắt đầu quét toàn bộ Thư mục 210 ngầm...");
+  var folderId = '0B_q5HyYkeLftU1NNSzhDWnRYVzA';
+  var parentFolder = null;
+  try { parentFolder = DriveApp.getFolderById(folderId); } catch (e) { return; }
+  if (!parentFolder) return;
+
+  var lines = [];
+  lines.push("------------------- Danh sách Văn bản / Tài liệu Thư mục 210 (Documents Management: 211→219) -------------------");
+
+  function scanFolderFull(folder, pathPrefix) {
+    if (!folder) return;
+    try {
+      var files = folder.getFiles();
+      while (files && files.hasNext()) {
+        try {
+          var file = files.next();
+          if (!file) continue;
+          var fName = file.getName();
+          var fUrl = file.getUrl();
+          var fMime = file.getMimeType();
+          var fullPath = pathPrefix ? (pathPrefix + " > " + fName) : fName;
+
+          var textContent = "";
+          if (fMime === MimeType.GOOGLE_DOCS) {
+            try {
+              var doc = DocumentApp.openById(file.getId());
+              if (doc) textContent = doc.getBody().getText();
+            } catch (de) { }
+          }
+
+          lines.push("- Tài liệu: \"" + fName + "\" | Vị trí công ty/bộ phận: " + fullPath);
+          lines.push("  Link xem: " + fUrl);
+          if (textContent) {
+            var snippet = textContent.replace(/\s+/g, ' ').substring(0, 1000);
+            lines.push("  Trích yếu nội dung: " + snippet);
+          }
+        } catch (e) { }
+      }
+    } catch (e) { }
+
+    try {
+      var subFolders = folder.getFolders();
+      while (subFolders && subFolders.hasNext()) {
+        var sub = subFolders.next();
+        if (sub) scanFolderFull(sub, pathPrefix ? (pathPrefix + " > " + sub.getName()) : sub.getName());
+      }
+    } catch (e) { }
+  }
+
+  scanFolderFull(parentFolder, "210. Documents Management");
+  var resultText = lines.join('\n');
+
+  try {
+    saveLegalDocsCache(resultText);
+    Logger.log("[Background Trigger] ✅ Đã hoàn tất quét ngầm toàn bộ Thư mục 210! Đã lưu vĩnh viễn dữ liệu (" + resultText.length + " ký tự) vào Google Sheet & Properties.");
+  } catch (e) {
+    Logger.log("[Background Trigger] Error saving cache: " + e.message);
+  }
+}
+
+/**
+ * ⏰ THIẾT LẬP TRIGGER TỰ ĐỘNG QUÉT NGẦM MỖI 1 GIỜ
+ */
+function setupLegalDocsHourlyTrigger() {
+  var triggers = ScriptApp.getProjectTriggers();
+  for (var i = 0; i < triggers.length; i++) {
+    if (triggers[i].getHandlerFunction() === 'refreshLegalDocsCacheTrigger') {
+      ScriptApp.deleteTrigger(triggers[i]);
+    }
+  }
+  ScriptApp.newTrigger('refreshLegalDocsCacheTrigger')
+    .timeBased()
+    .everyHours(1)
+    .create();
+  Logger.log("✅ Đã tạo Trigger quét ngầm tự động mỗi 1 giờ!");
 }
 
 /*
@@ -3533,15 +3707,66 @@ function submitDialogVPP(event) {
 
     sheet1.insertRows(3, 1);
 
-    sheet1.getRange("A3").setValue(getCurrentFormattedDate())
-    sheet1.getRange("B3").setValue(user)
-    sheet1.getRange("C3").setValue(vpp)
-    sheet1.getRange("D3").setValue(quantity)
-    sheet1.getRange("F3").setValue(link)
+    const timestamp = getCurrentFormattedDate();
+    sheet1.getRange("A3").setValue(timestamp);
+    sheet1.getRange("B3").setValue(user);
+    sheet1.getRange("C3").setValue(vpp);
+    sheet1.getRange("D3").setValue(quantity);
+    sheet1.getRange("F3").setValue(link);
 
-    var mess = "Bạn đã đăng ký thành công ✅ <https://docs.google.com/spreadsheets/d/10Czvm2uyipN67r39h8_I6c3kVBMZTOE7dS8jwIa-QUQ/edit?gid=617945518#gid=617945518|Xem chi tiết>"
-    sendMessageByChatBot({ text: mess }, space)
-    sendEmail('200announcement@planadd.com', user, vpp, quantity, link)
+    var vppSheetUrl = "https://docs.google.com/spreadsheets/d/10Czvm2uyipN67r39h8_I6c3kVBMZTOE7dS8jwIa-QUQ/edit?gid=617945518#gid=617945518";
+
+    // ── Gửi Card thông báo trực tiếp từ 200AI với định dạng đẹp (CardsV2) thay cho Email ──
+    var notifyWidgets = [
+      { textParagraph: { text: '- <b>Người đăng ký</b>: ' + user } },
+      { textParagraph: { text: '- <b>Văn phòng phẩm</b>: ' + vpp } },
+      { textParagraph: { text: '- <b>Số lượng</b>: ' + quantity } }
+    ];
+    if (link && link.trim() !== '') {
+      notifyWidgets.push({ textParagraph: { text: '- <b>Link sản phẩm</b>: ' + link } });
+    }
+    notifyWidgets.push({
+      buttonList: {
+        buttons: [{
+          text: '📊 Xem Google Sheet',
+          onClick: { openLink: { url: vppSheetUrl } }
+        }]
+      }
+    });
+
+    var notifyMsg = {
+      cardsV2: [{
+        card: {
+          header: {
+            title: '🧷 ĐĂNG KÝ VĂN PHÒNG PHẨM',
+            subtitle: '⏳ ' + timestamp,
+            imageUrl: 'https://fonts.gstatic.com/s/i/short-term/release/googlesymbols/edit_note/default/24px.svg'
+          },
+          sections: [{
+            widgets: notifyWidgets
+          }],
+          fixedFooter: {
+            primaryButton: {
+              text: 'Xem Google Sheet',
+              onClick: {
+                openLink: {
+                  url: vppSheetUrl
+                }
+              }
+            }
+          }
+        }
+      }]
+    };
+
+    // 1. Gửi thông báo xác nhận đơn giản trong khung chat của người dùng
+    var userMess = "Bạn đã đăng ký thành công ✅ <" + vppSheetUrl + "|Xem chi tiết>";
+    if (space && space !== 'spaces/AAQA2_sKqYQ') {
+      sendMessageByChatBot({ text: userMess }, space);
+    }
+
+    // 2. Gửi Card V2 định dạng đẹp tới nhóm 200.Notification (spaces/AAQA2_sKqYQ)
+    sendMessageByChatBot(notifyMsg, 'spaces/AAQA2_sKqYQ');
 
     return {
       actionResponse: {
@@ -5680,6 +5905,7 @@ function buildStampDocumentDialog() {
                   { text: "Boss' title — Dấu chức danh Boss", value: "Boss' title — Dấu chức danh Boss", selected: false },
                   { text: "Ms.Huong's signature — Dấu chữ ký Ms. Hương", value: "Ms.Huong's signature — Dấu chữ ký Ms. Hương", selected: false },
                   { text: "Mrs.Huong's title — Dấu chức danh Mrs. Hương", value: "Mrs.Huong's title — Dấu chức danh Mrs. Hương", selected: false },
+                  { text: "Mrs.Huong's title — Dấu chức danh Mr. Thuyết", value: "Mrs.Huong's title — Dấu chức danh Mr. Thuyết", selected: false },
                   { text: "Madam Kim's title — Dấu chức danh Madam Kim", value: "Madam Kim's title — Dấu chức danh Madam Kim", selected: false }
                 ]
               }
@@ -5980,6 +6206,11 @@ function isLinkRequest(text) {
   // Bỏ qua nếu đây là câu hỏi về Penalty & Bonus, Ngày phép, hoặc Chấm công để không bị nhầm thành tìm file Drive
   if (/penalty|bonus|phạt|thưởng|tim|bom|❤️|💣|điểm|đánh giá|phép|phéo|vacation|leave|nghỉ|chấm công|dữ liệu chấm công|muộn|trễ|quên|về sớm|tổng công|công tháng|checkin|checkout/.test(lower)) {
     return false;
+  }
+
+  // 🌟 NẾU LÀ CÂU HỎI TRÍCH XUẤT THÔNG TIN / CHỈ SỐ DOANH NGHIỆP (Mã số thuế, vốn điều lệ, người đại diện...) -> Kích hoạt ngay luồng Drive Search & AI Extraction
+  if (typeof isInfoExtractionRequest === 'function' && isInfoExtractionRequest(lower)) {
+    return true;
   }
 
   for (var i = 0; i < LINK_TRIGGER_KEYWORDS.length; i++) {
@@ -6490,7 +6721,7 @@ function extractSearchKeywordByGemini(userMessage) {
     "CÁC CÔNG TY THÀNH VIÊN VÀ CHI NHÁNH: ADC, ADD, AGB, ASG, TYM VINA & CESS, VPA (bao gồm VPA HCM, VPA HN), Worksmate, ADD Group, Se ADD, KPA, GEO ADD, ADD CON.\n\n" +
     "QUY TẮC BẮT BUỘC TRẢ VỀ:\n" +
     "1. Nếu người dùng nêu rõ chi nhánh (HCM, Hà Nội, HN, Đà Nẵng...), hãy giữ nguyên tên chi nhánh (Ví dụ: 'VPA HCM', 'VPA HN').\n" +
-    "2. 'ERC', 'IRC', 'đăng ký kinh doanh', 'đầu tư', 'giấy phép kinh doanh' -> mã 211.2\n" +
+    "2. 'ERC', 'IRC', 'đăng ký kinh doanh', 'đầu tư', 'giấy phép kinh doanh', 'mã số thuế', 'msdn', 'mst', 'vốn', 'vốn điều lệ', 'người đại diện', 'đại diện pháp luật' -> mã 211.2\n" +
     "3. 'điều lệ', 'quy định', 'quy chế' -> mã 211.1\n" +
     "4. 'sổ đỏ', 'gpxd', 'pccc', 'giấy phép xây dựng' -> mã 211.7\n" +
     "5. 'nhãn hiệu', 'brand' -> mã 211.4\n" +
@@ -6521,8 +6752,8 @@ function extractSearchKeywordByGemini(userMessage) {
   // 2. ⭐ BỘ LỌC DỰ PHÒNG THÔNG MINH (Rule-based Fallback)
   var compName = extractCompanyName(lower);
 
-  // ERC / IRC / Đăng ký kinh doanh / Đầu tư / ĐKKD -> 211.2
-  if (lower.indexOf("erc") !== -1 || lower.indexOf("irc") !== -1 || lower.indexOf("đăng ký kinh doanh") !== -1 || lower.indexOf("dkkd") !== -1 || lower.indexOf("đkkd") !== -1 || lower.indexOf("đầu tư") !== -1 || lower.indexOf("211.2") !== -1) {
+  // ERC / IRC / Đăng ký kinh doanh / Đầu tư / ĐKKD / Mã số thuế / MST / MSDN / Vốn / Đại diện -> 211.2
+  if (lower.indexOf("erc") !== -1 || lower.indexOf("irc") !== -1 || lower.indexOf("đăng ký kinh doanh") !== -1 || lower.indexOf("dkkd") !== -1 || lower.indexOf("đkkd") !== -1 || lower.indexOf("đầu tư") !== -1 || lower.indexOf("211.2") !== -1 || lower.indexOf("mã số thuế") !== -1 || lower.indexOf("mst") !== -1 || lower.indexOf("msdn") !== -1 || lower.indexOf("vốn") !== -1 || lower.indexOf("đại diện") !== -1) {
     return compName ? ("211.2 " + compName) : "211.2";
   }
   // Điều lệ / Quy định / Quy chế -> 211.1
@@ -7915,7 +8146,8 @@ function handleCleaningScheduleQuery(senderName, isForceReset) {
     msg += "• *" + item.dayName + ":* " + item.person.name + " (" + item.person.nick + ")" + isTodayMark + "\n";
   }
 
-  msg += "\n📌 _Yêu cầu: Người trực ban kiểm tra vệ sinh văn phòng & cập nhật tiến độ Task 275 mỗi ngày._";
+  msg += "\n📌 _Yêu cầu: Người trực ban kiểm tra vệ sinh văn phòng & cập nhật tiến độ Task 275 mỗi ngày._\n" +
+    "🔗 *Link Sheet cập nhật Task 275:* https://docs.google.com/spreadsheets/d/1Mb9EEfxouUS0hFxL5wM4Cur7weJW6804chDN8WetAQ0/edit?gid=1404191066#gid=1404191066";
 
   return { text: msg };
 }
@@ -7943,7 +8175,8 @@ function sendDailyCleaningReminderTrigger() {
     "👤 *NGƯỜI TRỰC BAN VỆ SINH:* *" + assignedPerson.name + "* (" + assignedPerson.email + ")\n\n" +
     "📌 *Nhiệm vụ kiểm tra vệ sinh (Task 275):*\n" +
     "• Đi kiểm tra tổng thể vệ sinh công ty (sàn nhà, bàn làm việc, khu vực chung, phòng họp).\n" +
-    "• Cập nhật tiến độ vào hạng mục: _275. Clean office and administrative work_.\n\n" +
+    "• Cập nhật tiến độ vào hạng mục: _275. Clean office and administrative work_.\n" +
+    "🔗 *Link Sheet cập nhật Task 275:* https://docs.google.com/spreadsheets/d/1Mb9EEfxouUS0hFxL5wM4Cur7weJW6804chDN8WetAQ0/edit?gid=1404191066#gid=1404191066\n\n" +
     "📋 *Lịch trực ban tuần này của Phòng 200:*\n";
 
   for (var s = 0; s < schedule.length; s++) {
@@ -8039,7 +8272,8 @@ function testSendDailyCleaningReminder() {
     "👤 *NGƯỜI TRỰC BAN VỆ SINH:* *" + assignedPerson.name + "* (" + assignedPerson.email + ")\n\n" +
     "📌 *Nhiệm vụ kiểm tra vệ sinh (Task 275):*\n" +
     "• Đi kiểm tra tổng thể vệ sinh công ty (sàn nhà, bàn làm việc, khu vực chung, phòng họp).\n" +
-    "• Cập nhật tiến độ vào hạng mục: _275. Clean office and administrative work_.\n\n" +
+    "• Cập nhật tiến độ vào hạng mục: _275. Clean office and administrative work_.\n" +
+    "🔗 *Link Sheet cập nhật Task 275:* https://docs.google.com/spreadsheets/d/1Mb9EEfxouUS0hFxL5wM4Cur7weJW6804chDN8WetAQ0/edit?gid=1404191066#gid=1404191066\n\n" +
     "📋 *Lịch trực ban tuần này của Phòng 200:*\n";
 
   for (var s = 0; s < schedule.length; s++) {
